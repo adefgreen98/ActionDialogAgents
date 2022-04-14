@@ -1,0 +1,11 @@
+/.idea/
+/data.zip
+/github_token.txt
+/wandb/
+/*/wandb/
+/visual_features/clip_models/
+/visual_features/moca_models/
+/*results/
+/__pycache__/
+/*/__pycache__/
+/dataset/
