@@ -6,6 +6,9 @@
 /visual_features/clip_models/
 /visual_features/moca_models/
 /*results/
+/*/*_results/
 /__pycache__/
 /*/__pycache__/
 /dataset/
+/*/old/
+/visual_features/old/
