@@ -12,7 +12,11 @@ from torchvision import transforms
 from collections import defaultdict
 from PIL import Image
 from torch.utils.data import Dataset, Subset
+from torchvision.transforms.functional import to_tensor
 from tqdm import tqdm
+
+import sys
+sys.path.extend(['..', '.'])
 
 from visual_features.vision_helper.utils import collate_fn as default_collate_fn
 
@@ -55,9 +59,16 @@ def convert_action(name: str):
     return ACTION_CONVERSION_TABLE[int(name)]
 
 
+def rework_annotations_path(df, basepath):
+    # TODO: automatic handling of different path specifications
+    df['after_image_path'] = df['after_image_path'].map(lambda pth: str(Path(basepath) / '../..' / pth))
+    df['before_image_path'] = df['before_image_path'].map(lambda pth: str(Path(basepath) / '../..' / pth))
+    return df
+
+
 class ActionDataset(Dataset):
     def __init__(self,
-                 path='../dataset/pickupable-held',
+                 path='dataset/data-bbxs/pickupable-held',
                  negative_sampling_method='fixed_onlyhard',
                  soft_negatives_nr=2,
                  image_extension='png',
@@ -66,6 +77,12 @@ class ActionDataset(Dataset):
 
         self.path = Path(path)
 
+        # TODO: drop the (train-)split column and select which (train-)split to use
+        # annotations dataframe
+        self.annotation = pandas.read_csv(self.path / '..' / 'bbox-data.csv', index_col=0)
+        self.annotation = rework_annotations_path(self.annotation, self.path)
+        self.annotation.index = pandas.Series(range(len(self.annotation)))  # rework index for consistency
+
         self.image_extension = image_extension
 
         # defining method for sampling negatives
@@ -73,15 +90,15 @@ class ActionDataset(Dataset):
         self.negative_sampling_method = negative_sampling_method
         self.soft_negatives_nr = soft_negatives_nr
 
-        # populated by self._load_samples()
-        self._scenes_objs_dict = None
-        self.actions = None
-        self.objects = None
+        self.actions_map = dict(set(zip(self.annotation['action_name'].to_list(), self.annotation['action_id'].to_list())))
+        self.objects = dict(set(zip(
+            self.annotation['object_name'].to_list(),
+            [int(self.annotation.loc[i, 'image_name'].split("_")[0]) for i in range(len(self.annotation))]
+        )))
 
-        # populates dataset
-        self.samples = self._load_samples()
-
-        assert self.actions is not None and self.objects is not None
+        # populates contrasts
+        # self.samples = self._load_samples()
+        self._load_negatives()
 
         # defines default transformation of torchvision models (if not provided)
         self.transform = transforms.Compose([
@@ -90,79 +107,62 @@ class ActionDataset(Dataset):
             transforms.ToTensor()
         ]) if transform is None else transform
 
-
-
     def __len__(self):
-        return len(self.samples)
+        return len(self.annotation)
+
+    def _read_image_from_annotation_path(self, path: str):
+        pth = self.path / Path(*Path(path).parts[-2:])
+        return Image.open(pth)
 
     def __getitem__(self, i) -> dict:
-        smp = self.samples[i]
+        # smp = self.samples[i]
+        # res = {
+        #     'positive': self.transform(Image.open(str(self.path / smp['scene'] / smp['positive']))),
+        #     'before': self.transform(Image.open(str(self.path / smp['scene'] / smp['before']))),
+        #     'action': smp['action'],
+        #     'neg_actions': smp['neg_actions'],
+        #     'negatives': [self.transform(Image.open(str(self.path / neg))) for neg in smp['negatives']]  # since negatives may be from a different scene their path should already contain it
+        # }
+        smp = self.annotation.iloc[i]
         res = {
-            'positive': self.transform(Image.open(str(self.path / smp['scene'] / smp['positive']))),
-            'before': self.transform(Image.open(str(self.path / smp['scene'] / smp['before']))),
-            'action': smp['action'],
-            'neg_actions': smp['neg_actions'],
-            'negatives': [self.transform(Image.open(str(self.path / neg))) for neg in smp['negatives']]  # since negatives may be from a different scene their path should already contain it
+            'positive': self.transform(self._read_image_from_annotation_path(smp['after_image_path'])),
+            'before': self.transform(self._read_image_from_annotation_path(smp['before_image_path'])),
+            'action': smp['action_id'],
+            'neg_actions': [self.annotation.loc[neg_i, 'action_id'] for neg_i in smp['contrast']],
+            'negatives': [self.transform(self._read_image_from_annotation_path(self.annotation.loc[neg_i, 'after_image_path'])) for neg_i in smp['contrast'][0]],
         }
         return res
 
-    def _load_samples(self):
-        """
-        Precomputes samples' dictionaries (containing: before frame path, after frame path, action id, wrong-after-frames paths, wrong-action-ids)
-         by sampling negatives according to the specified method.
+    def _load_negatives(self):
+        """Computes contrast sets by adding a new column ('contrast') to the annotation DataFrame.
+
         Possible methods (determined by the 'negative_sampling_method' field of this class) are:
-            * fixed, same environment
-            * fixed, different environments plus same environment (hard distractors) (TODO)
-            * randomized different environments plus fixed of same environment (TODO)
-            * randomized from different scenes, while the positive is the only one from the actual scene
+        * fixed, same environment
+        * fixed, different environments plus same environment (hard distractors) (TODO)
+        * randomized different environments plus fixed of same environment (TODO)
+        * randomized from different scenes, while the positive is the only one from the actual scene
         """
-        scenes_objs_dict = defaultdict(lambda: defaultdict(list))  # needed for fast creation of negatives
-        for scene in os.listdir(self.path):
-            if (self.path / scene).is_dir():
-                for fname in os.listdir(self.path / scene):
-                    if fname.endswith(self.image_extension):
-                        scenes_objs_dict[scene][self.obj_from_path(fname)].append(fname)
-        self._scenes_objs_dict = scenes_objs_dict  # needed for VecTransformDataset
-
-        self.actions = set([self.action_from_path(name) for d in self._scenes_objs_dict.values() for v in d.values() for name in v])
-        self.objects = set([obj for d in self._scenes_objs_dict.values() for obj in d.keys()])
-
-        res = []
-        for scene in os.listdir(self.path):
-            if (self.path / scene).is_dir():
-                for fname in os.listdir(self.path / scene):
-                    if fname.endswith(self.image_extension) and self.action_from_path(fname) != '0':
-                        action = self.action_from_path(fname)
-                        obj = self.obj_from_path(fname)
-                        before = "_".join([obj, "0"]) + '.' + self.image_extension
-
-                        neg_paths = None
-                        neg_actions = None
-
-                        if self.negative_sampling_method == 'fixed_onlyhard':
-                            neg_paths = [os.path.join(scene, neg) for neg in set(scenes_objs_dict[scene][obj]) - {before, fname}]
-                            neg_actions = [self.action_from_path(neg) for neg in neg_paths]
-                        elif self.negative_sampling_method == 'random_onlysoft':
-                            other_samples = [os.path.join(sc, other_path) for sc, ob in scenes_objs_dict.items()
-                                             for other_path in [el for obj_list in ob.values() for el in obj_list]
-                                             if sc != scene]
-                            neg_paths = random.sample(other_samples, k=self.soft_negatives_nr)
-                            neg_actions = [__other_scene_action_id__ for _ in neg_paths]
-
-                        res.append({
-                            'scene': scene,
-                            'action': action,  # TODO: convert this into sentence action
-                            'before': before,
-                            'positive': fname,
-                            'negatives': neg_paths,
-                            'neg_actions': neg_actions
-                        })
-
-        return res
-
-    def get_filenames_dict(self):
-        """Returns the dictionary associating scenes to objects, and these to all filenames containing that object."""
-        return self._scenes_objs_dict
+        self.annotation['contrast'] = None
+        if self.negative_sampling_method == 'fixed_onlyhard':
+            contrasts = [
+                self.annotation[lambda df: df['before_image_path'] == before_img].index
+                for before_img in set(self.annotation['before_image_path'].to_list())
+            ]
+            for c in contrasts:
+                for img_idx in c:
+                    self.annotation.loc[img_idx, 'contrast'] = [[list(set(c) - {img_idx})]]  # needed 3-dim list for pandas array assignment
+        elif self.negative_sampling_method == 'random_onlysoft':
+            indices = self.annotation.index.to_list()
+            for i in range(len(self.annotation)):
+                c = []
+                while len(c) < self.soft_negatives_nr:
+                    neg_i = random.sample(indices, k=1)
+                    neg_smp = self.annotation[neg_i]
+                    if neg_i != i and \
+                            neg_smp['contrast_set'] == self.annotation.iloc[i]['contrast_set'] and \
+                            neg_smp['scene'] != self.annotation.iloc[i]['scene']:
+                        c.append(neg_i)
+                self.annotation.loc[i, 'contrast'] = c
 
     @staticmethod
     def _scene_from_path(p) -> str:
@@ -208,7 +208,7 @@ class VecTransformDataset(Dataset):
         ------------------------------------------------------------------------
 
         :param extractor_model: name for convolutional model that will be used for exracting features
-        :param override_transform: torchvision.transform that will replace the one provided by the model
+        :param override_transform: torchvision.transform that will replace the one provided by the model (default: None); it can also be a string "to_tensor", automatically initializing it as a ToTensor transform.
         :param hold_out_size: size of the held-out set, in terms of items selected to be excluded (respectively: object instances, scenes, object types, object instances of a specific scene)
         :param hold_out_procedure: type of hold out method used (default: None)
         :param hold_out_indices: allows specifying indices of items of the hold-out group that will be selected
@@ -216,26 +216,38 @@ class VecTransformDataset(Dataset):
         :param kwargs: keyword arguments for the internal ActionDataset structure
         """
 
-        self._action_dataset = ActionDataset(**kwargs)
+        self._action_dataset = ActionDataset(**kwargs, transform=transforms.ToTensor())
         self.extractor_model = extractor_model
-        self.override_transform = override_transform
-        self.path = (self._action_dataset.path / 'visual-vectors' / self.extractor_model).with_suffix('.pkl')
+        self.path = (self._action_dataset.path / 'visual-vectors' / self.extractor_model)
+
+        self.actions_to_ids = self._action_dataset.actions_map
+        self.ids_to_actions = {v: k for k, v in self.actions_to_ids.items()}
+
+        if isinstance(override_transform, str):
+            if override_transform == 'to_tensor':
+                self.override_transform = transforms.ToTensor()
+        else:
+            self.override_transform = override_transform
 
         if not os.path.exists(self.path):
-            self.samples = self.preprocess()
+            os.makedirs(self.path, exist_ok=True)
+            self.before_vectors, self.after_vectors = self.preprocess()
+            with open(self.path / 'before.pkl', mode='wb') as bpth:
+                pickle.dump(self.before_vectors, bpth)
+            with open(self.path / 'after.pkl', mode='wb') as apth:
+                pickle.dump(self.after_vectors, apth)
         else:
-            with open(self.path) as pth:
-                """
-                samples = {
-                    'before_vectors' --> {scene --> {object --> v}},
-                    'after_vectors' ---> DataFrame['scene', 'object', 'action', 'vector']
-                }
-                """
-                self.samples = pickle.load(pth)
+            """
+            samples = {
+                'before_vectors' --> {scene --> {object --> v}},
+                'after_vectors' ---> DataFrame['scene', 'object', 'action', 'vector']
+            }
+            """
+            with open(self.path / 'before.pkl', mode='rb') as bpth:
+                self.before_vectors = pickle.load(bpth)
 
-        self.actions = sorted(list(set(self.samples['action'].tolist())))
-        self.objects = sorted(list(set(self.samples['object'].tolist())))
-        self.scenes = sorted(list(set(self.samples['scene'].tolist())))
+            with open(self.path / 'after.pkl', mode='rb') as apth:
+                self.after_vectors = pickle.load(apth)
 
         assert hold_out_procedure in self.allowed_holdout_procedures
         self.hold_out_procedure = hold_out_procedure
@@ -251,10 +263,11 @@ class VecTransformDataset(Dataset):
 
             # prepares the set where to choose hold-out items (according to hold-out methods)
             self.hold_out_item_group = {
-                'object': self.objects,
-                'scene': self.scenes,
+                'object': set(self._action_dataset.objects.keys()),
+                'scene': set(self._action_dataset.annotation['action_id'].to_list()),
                 'object_type': None,
-                'sample': self.samples }[self.hold_out_procedure]
+                'sample': self.after_vectors.index.to_list()
+            }[self.hold_out_procedure]
 
             if self.hold_out_indices is None:
                 self.hold_out_indices = list(range(len(self.hold_out_item_group)))
@@ -263,19 +276,23 @@ class VecTransformDataset(Dataset):
                 self.hold_out_indices = self.hold_out_indices[-self.hold_out_size:]
 
             # creates list of dataset row indices to exclude according to selected hold-out items
-            msk = self.samples['after_vectors'][self.hold_out_procedure] in {self.hold_out_item_group[idx] for idx in self.hold_out_indices}
-            self.hold_out_rows = self.samples['after_vectors'][msk].index.tolist()
+            msk = self._action_dataset.annotation[self.hold_out_procedure] in {self.hold_out_item_group[idx] for idx in self.hold_out_indices}
+            self.train_rows = self.after_vectors[not msk].index
+            self.hold_out_rows = self.after_vectors[msk].index
+        else:
+            self.hold_out_size = 0
+            self.hold_out_rows = pandas.Series([])
 
 
     def __len__(self):
-        return len(self.samples['after_vectors'])
+        return len(self.after_vectors)
 
     def __getitem__(self, item):
-        after_smp = self.samples['after_vectors'][item]
+        after_smp = self.after_vectors.iloc[item]
         res = (
-            self.samples['before_vectors'][after_smp['scene'].item()][after_smp['object'].item()],
-            after_smp['vector'].item(),
-            after_smp['action'].item()
+            self.before_vectors[after_smp['before_image_path']],
+            after_smp['action_id'].item(),
+            after_smp['vector'].item()
         )
         return res
 
@@ -283,46 +300,34 @@ class VecTransformDataset(Dataset):
         from argparse import Namespace
         from visual_features.visual_baseline import load_model_and_transform
 
-        extractor, transform = load_model_and_transform(Namespace(model_name=self.extractor_model, device='cuda' if torch.cuda.is_available() else 'cpu'))
+        extractor, transform = load_model_and_transform(
+            Namespace(model_name=self.extractor_model, device='cuda' if torch.cuda.is_available() else 'cpu'),
+            keep_pooling=self.extractor_model != 'clip-rn',
+            add_flatten=False
+        )
         extractor.eval()
 
         # Overrides image transformation if needed (e.g. different normalization factors)
         if self.override_transform is not None:
             transform = self.override_transform
 
-        # Adds tensorization if not present
-        if isinstance(transform, transforms.Compose):
-            if not isinstance(transform.transforms[0], transforms.ToTensor):
-                transform = transforms.Compose([transforms.ToTensor(), *transform.transforms])
+        # excludes 'contrast' column from the action categorization task and adds the 'vector' column
+        self.after_vectors = self._action_dataset.annotation[[c for c in self._action_dataset.annotation.columns if c not in {'contrast'}]].copy()
+        self.before_vectors = None
 
-        # see note in __init__ for explanation
-        self.samples = {
-            'before_vectors': {},
-            'after_vectors': []
-        }
+        def get_vec(pth):
+            return extractor(transform(Image.open(pth)).unsqueeze(0).to(extractor.device)).squeeze().cpu()
 
-        def get_vec(s, n):
-            return extractor(transform(Image.open(Path(s, n))).unsqueeze(0).to(extractor.device)).squeeze().cpu().to_numpy()
+        with torch.no_grad():
+            self.after_vectors['vector'] = pandas.Series([
+                get_vec(pth)
+                for pth in tqdm(self.after_vectors['after_image_path'], desc=f"Extracting 'after' visual vectors using {self.extractor_model}...")
+            ])
+            self.before_vectors = {
+                bf_path: get_vec(bf_path) for bf_path in tqdm(set(self.after_vectors['before_image_path'].to_list()), desc=f"Extracting 'before' visual vectors using {self.extractor_model}...")
+            }
 
-        for smp in tqdm(self._action_dataset.samples, desc=f'Extracting visual vectors using {self.extractor_model}...'):
-            scene = smp['scene']
-            before = smp['before']
-            action = smp['action']
-            positive = smp['positive']
-
-            obj = self._action_dataset.obj_from_path(before)
-
-            self.samples['after_vectors'].append({
-                'action': action,
-                'object': obj,
-                'scene': scene,
-                'vector': get_vec(scene, positive)
-            })
-            self.samples['before_vectors'][scene][obj] = get_vec(scene, before)
-
-        self.samples['after_vectors'] = pandas.DataFrame(self.samples['after_vectors'])  # needed for holding out
-
-        return self.samples
+        return self.before_vectors, self.after_vectors
 
 
     def split(self, for_regression=False):
@@ -333,15 +338,22 @@ class VecTransformDataset(Dataset):
         if self.hold_out_procedure == 'none':
             raise RuntimeError('trying to make the hold out set but no holding out procedure was specified')
 
-        train_indices = list(set(range(len(self))) - set(self.hold_out_rows))
-        train = Subset(self, train_indices)
-        hold_out = Subset(self, self.hold_out_rows)
+        hold_out = Subset(self, self.hold_out_rows.to_list())
+        if not for_regression:
+            train = Subset(self, self.train_rows.to_list())
+            return train, hold_out
+        else:
+            train_after_df = self.after_vectors.iloc[self.train_rows]
+            train_after = {action: [] for action in set(self.after_vectors['action_id'].to_list())}
+            train_before = {action: [] for action in set(self.after_vectors['action_id'].to_list())}
+            for after_row in train_after_df.iterrows():
+                train_after[after_row['action_id']].append(after_row['vector'])
+                train_before[after_row['action_id']].append(self.before_vectors[after_row['before_image_path']])
 
-        if for_regression:
-            col = self.samples['vector']
-            train = torch.stack(col[train_indices].tolist(), )
+            train_after = {action: torch.stack(train_after[action], dim=0) for action in train_after}
+            train_before = {action: torch.stack(train_before[action], dim=0) for action in train_after}
+            return (train_before, train_after), hold_out
 
-        return train, hold_out
 
 
 
@@ -349,14 +361,17 @@ class VecTransformDataset(Dataset):
 class BBoxDataset(torch.utils.data.Dataset):
 
     def __init__(self,
-                 path='../dataset/bboxes/train',
+                 path='dataset/data-bbxs/pickupable-held',
                  transform=None,
                  image_extension='png',
                  object_conversion_table=None):
 
+        # TODO: add split information and separate train/valid/test splits
+        # TODO: add info about pickupable vs non-pickupable (up to now it is supposed to be either one of the two)
         self.path = Path(path)
         self.image_extension = image_extension
 
+        # TODO: update these values with newer ones
         self._stats = {
             'mean': torch.tensor([0.4689, 0.4682, 0.4712]),
             'std': torch.tensor([0.2060, 0.2079, 0.2052])
@@ -364,41 +379,65 @@ class BBoxDataset(torch.utils.data.Dataset):
 
         self.transform = transforms.ToTensor() if transform is None else transform
 
-        self._annotations = pandas.read_csv(self.path / '..' / 'labels.csv', index_col=0)
+        self._annotations = pandas.read_csv(self.path / '..' / 'bbox-data.csv', index_col=0)
+        self._annotations = rework_annotations_path(self._annotations, self.path)
 
-        self._samples = []
-        for s in os.listdir(self.path):
-            if s.endswith(self.image_extension):
-                coords = self.tensorize_bbox_from_str(self._annotations[lambda df: df['image_name'] == s]['bbox'].item())
-                if coords[0] >= coords[2] or coords[1] >= coords[3]:
-                    pass  # invalid coordinates
-                else:
-                    self._samples.append(s)
+        added_before_samples = {}
+        for idx, row in self._annotations.iterrows():
+            if added_before_samples.get(row['before_image_path'], None) is None:
+                tmp = row.copy()
+                tmp['after_image_path'] = None
+                tmp['after_image_bb'] = None
+                tmp['image_name'] = tmp['before_image_name']  # needed for image_name_from_idx
+                added_before_samples[row['before_image_path']] = tmp
 
-        self.objs_to_ids = {
-                name: i for i, name in enumerate(sorted(list({row['object_id'].split("|")[0] for _, row in self._annotations.iterrows()})))
-        } if object_conversion_table is None else object_conversion_table
+        self._annotations = self._annotations.append(list(added_before_samples.values()), ignore_index=True)
+        self._annotations = self._annotations.sample(frac=1.0, random_state=42)  # just needed to shuffle before and after rows, more stochasticity may come in DataLoaders
+
+        self.objs_to_ids = {name: i for i, name in enumerate(list(set(self._annotations['object_name'])))} if object_conversion_table is None else object_conversion_table
 
         self.ids_to_objs = {v: k for k, v in self.objs_to_ids.items()}
 
+        self.excluded_files = []
+        for i, row in self._annotations.iterrows():
+            name = row['after_image_path'] if row['after_image_path'] is not None else row['before_image_path']
+            boxes = row['after_image_bb'] if row['after_image_bb'] is not None else row['before_image_bb']
+            boxes = self.tensorize_bbox_from_str(boxes)
+            if not torch.logical_and(boxes[0] < boxes[2], boxes[1] < boxes[3]):
+                self.excluded_files.append(name)
+                self._annotations.drop(labels=i, axis=0, inplace=True)
+
+        self._annotations.index = pandas.Series(range(len(self._annotations)))  # rework for better consistency
+
     def __len__(self):
-        return len(self._samples)
+        return len(self._annotations)
 
     def __getitem__(self, item):
-        smp = self._samples[item]
-        ann = self._annotations[lambda df: df['image_name'] == smp]
-        obj_id = self.convert_object_to_ids(self.obj_name_from_df_row(ann))
+        smp = self._annotations.iloc[item]
+        if smp['after_image_path'] is None:
+            # is a before image
+            imgpath = smp['before_image_path']
+            obj_id = self.convert_object_to_ids(self.obj_name_from_df_row(smp))
+            boxes = self.tensorize_bbox_from_str(smp['before_image_bb']).unsqueeze(0)
+        else:
+            imgpath = smp['after_image_path']
+            obj_id = self.convert_object_to_ids(self.obj_name_from_df_row(smp))
+            boxes = self.tensorize_bbox_from_str(smp['after_image_bb']).unsqueeze(0)
 
-        img = self.transform(Image.open(self.path / smp))
-        boxes = self.tensorize_bbox_from_str(ann['bbox'].item()).unsqueeze(0)
+        assert torch.logical_and(boxes[:, 0] < boxes[:, 2], boxes[:, 1] < boxes[:, 3]), \
+            f"wrong box for image {imgpath} ({boxes.int().squeeze().tolist()})"
+
+        img = self.transform(Image.open(imgpath))
+
         # convert to COCO annotation
         ann = {
             'image_id': torch.tensor([item]),
             'boxes': boxes,
             'labels': torch.tensor([obj_id]),
             'area': (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0]),
-            'iscrowd': torch.zeros(1, dtype=torch.int64)
+            'iscrowd': torch.zeros(1, dtype=torch.int)
         }
+
         return img, ann
 
     def convert_object_to_ids(self, obj_name):
@@ -412,36 +451,41 @@ class BBoxDataset(torch.utils.data.Dataset):
 
     @classmethod
     def obj_name_from_df_row(cls, row):
-        return (row['object_id']).item().split("|")[0]
+        return row['object_name']
 
     @classmethod
     def tensorize_bbox_from_str(cls, s):
-        return torch.tensor([int(el) for el in s.strip('()').split(',')], dtype=float)
-
-    def retrieve_object_set_from_csv(self):
-        return {self.obj_name_from_df_row(row) for row in pandas.read_csv(self.path / ".." / "labels.csv").iterrows()}
+        return torch.tensor([int(el) for el in s.strip('()').split(',')], dtype=torch.float16)
 
     def get_stats(self):
         if self._stats is None:
-            acc = torch.stack([self[i] for i in range(len(self))], dim=0).view(3,-1)
+            tmp = self._annotations.copy()
+            tmp[lambda df: df['after_image_path'].isnull()]['after_image_path'] = tmp[lambda df: df['after_image_path'].isnull()]['before_image_path']
+            acc = torch.stack([to_tensor(Image.open(pth)) for pth in tmp['after_image_path']]).view(3, -1)
             self._stats = {'mean': acc.mean(dim=-1), 'std': acc.std(dim=-1)}
 
         return self._stats
 
+
     def image_name_from_idx(self, i):
-        return self._samples[i]
+        return self._annotations.loc[i, 'image_name']
 
 
-def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transform=None, **kwargs):
+def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transform=None, valid_ratio=0.2, **kwargs):
     if dataset_type == 'bboxes':
         # Transforms should be not none because FastRCNN require PIL images
-        train_set = BBoxDataset(os.path.join(data_path, 'train'), transform=transform, object_conversion_table=obj_dict)
-        valid_set = BBoxDataset(os.path.join(data_path, 'valid'), transform=transform, object_conversion_table=obj_dict)
-        test_set = BBoxDataset(os.path.join(data_path, 'test'), transform=transform, object_conversion_table=obj_dict)
-        dataset = {'train': train_set, 'valid': valid_set, 'test': test_set}
+        dataset = BBoxDataset(data_path, transform=transform, object_conversion_table=obj_dict)
+        indices = list(range(len(dataset)))
+        sep = int(len(dataset) * (1 - valid_ratio))
+        train_set = Subset(dataset, indices[:sep])
+        valid_set = Subset(dataset, indices[sep:])
         train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=default_collate_fn)
         valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=default_collate_fn)
         return dataset, train_dl, valid_dl
+    elif dataset_type == 'actions':
+        raise NotImplementedError
+    elif dataset_type == 'vect':
+        raise NotImplementedError
     else:
         raise ValueError(f"unsupported type of dataset '{dataset_type}'")
 
@@ -449,8 +493,6 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
 
 if __name__ == "__main__":
     from pprint import pprint
-
-    ds = BBoxDataset('../bboxes/train')
+    from visual_features.data import *
+    ds = VecTransformDataset()
     pprint(ds[0])
-    pprint(ds[0][0].shape)
-

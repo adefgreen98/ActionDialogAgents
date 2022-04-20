@@ -40,7 +40,7 @@ __default_train_config__ = {
     'unfreeze': False,
     'add_fpn': False,
 
-    'data_path': ('dataset/bboxes',),
+    'data_path': ('dataset/data-bbxs/pickupable-held',),
     'save_model': False,
     'save_path': ('bbox_results', ),
 
@@ -103,7 +103,7 @@ def init_detector(nr_target_categories,
             add_flatten=False
     )
 
-    tmean, tstd = transform.transforms[-1].mean, transform.transforms[-1].std
+    tmean, tstd = transform.transforms[-1].mean, transform.transforms[-1].std  # supposing Normalize is the last one applied
     if img_mean is not None:
         tmean = img_mean
     if img_std is not None:
@@ -336,7 +336,7 @@ def run_training(args):
     full_dataset, train_dl, valid_dl = get_data(args.data_path, batch_size=args.batch_size, dataset_type='bboxes',
                                                 transform=torchvision.transforms.ToTensor())
 
-    model = get_model(args, len(full_dataset['train'].get_object_set()), dataset=full_dataset['train'])
+    model = get_model(args, len(full_dataset.get_object_set()), dataset=full_dataset)
     optimizer, scheduler = get_optimizer(args, model)
     os.makedirs(args.save_path, exist_ok=True)
     model = iterate(args, model, train_dl, valid_dl, optimizer, scheduler=scheduler, greedy_save=args.save_model)
@@ -365,7 +365,7 @@ def debug_evaluation(args):
     # Substitute transform for compatibility issues with FasterRCNN (which has its own)
     full_dataset, train_dl, valid_dl = get_data(args, transform=torchvision.transforms.ToTensor())
 
-    model = get_model(args, len(full_dataset['train'].get_object_set()), dataset=full_dataset['train'])
+    model = get_model(args, len(full_dataset.get_object_set()), dataset=full_dataset)
 
     valid_metrics = eval(model, valid_dl, args.device)
 

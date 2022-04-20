@@ -41,7 +41,6 @@ DISTANCE_NAMES_MAP = {
 }
 
 
-
 # UTILITIES
 
 class MOCAVisEnc(nn.Module):
