@@ -90,7 +90,10 @@ class ActionDataset(Dataset):
         self.negative_sampling_method = negative_sampling_method
         self.soft_negatives_nr = soft_negatives_nr
 
-        self.actions_map = dict(set(zip(self.annotation['action_name'].to_list(), self.annotation['action_id'].to_list())))
+        # TODO: some action indices are missing (8, 13), so I had to workaround by using a new enumeration
+        # self.actions_map = dict(set(zip(self.annotation['action_name'].to_list(), self.annotation['action_id'].to_list())))
+        self.actions_map = {ac: i for i, ac in enumerate(list(set(self.annotation['action_name'].to_list())))}
+
         self.objects = dict(set(zip(
             self.annotation['object_name'].to_list(),
             [int(self.annotation.loc[i, 'image_name'].split("_")[0]) for i in range(len(self.annotation))]
@@ -127,8 +130,8 @@ class ActionDataset(Dataset):
         res = {
             'positive': self.transform(self._read_image_from_annotation_path(smp['after_image_path'])),
             'before': self.transform(self._read_image_from_annotation_path(smp['before_image_path'])),
-            'action': smp['action_id'],
-            'neg_actions': [self.annotation.loc[neg_i, 'action_id'] for neg_i in smp['contrast']],
+            'action': self.actions_map[smp['action_name']],
+            'neg_actions': [self.actions_map[self.annotation.loc[neg_i, 'action_name']] for neg_i in smp['contrast']],
             'negatives': [self.transform(self._read_image_from_annotation_path(self.annotation.loc[neg_i, 'after_image_path'])) for neg_i in smp['contrast'][0]],
         }
         return res
@@ -179,7 +182,7 @@ class ActionDataset(Dataset):
 
 class VecTransformDataset(Dataset):
 
-    allowed_holdout_procedures = ['none', 'object', 'scene', 'object_type', 'sample']
+    allowed_holdout_procedures = ['none', 'object_name', 'scene', 'object_type', 'sample']
 
     # NOTE: for regression matrix, each visual vector in float32 takes
     #                   0.000374510884 GB   ((1 * 100352 * 4) / 2^10)
@@ -197,13 +200,13 @@ class VecTransformDataset(Dataset):
         Initializes the dataset for vector transformation. Eventually, this also extracts visual vectors, if these
         are not present at the specified path (as additional keyword argument).
 
-        There are 5 possible hold out modalities:
+        There are 5 possible hold out modalities (with their string code in brackets):
 
-        * None
-        * Object: instances of the specified nr. of objects will be selected and excluded from each scene's training data, meaning that before and after vectors from all of their scenes will be placed in the hold-out dataset
-        * Scene: all vectors from a scene will be placed in the hold-out set
-        * Object type: all instances of a specific object type (e.g. 'Mug' of different colors) will be held out from all the scenes
-        * Sample: specific instances of an object will be held-out by picking them from a specific scene (useful when there are more than 1 object instance per scene)
+        * None [none]
+        * Object [object_name]: instances of the specified nr. of objects will be selected and excluded from each scene's training data, meaning that before and after vectors from all of their scenes will be placed in the hold-out dataset
+        * Scene [scene]: all vectors from a scene will be placed in the hold-out set
+        * Object type [object_type]: all instances of a specific object type (e.g. 'Mug' of different colors) will be held out from all the scenes
+        * Sample [sample]: specific instances of an object will be held-out by picking them from a specific scene (useful when there are more than 1 object instance per scene)
 
         ------------------------------------------------------------------------
 
@@ -239,8 +242,8 @@ class VecTransformDataset(Dataset):
         else:
             """
             samples = {
-                'before_vectors' --> {scene --> {object --> v}},
-                'after_vectors' ---> DataFrame['scene', 'object', 'action', 'vector']
+                'before_vectors' --> {before_path --> v}},
+                'after_vectors' ---> DataFrame['scene', 'object', 'action', 'vector'] (+ other columns from ActionDataset)
             }
             """
             with open(self.path / 'before.pkl', mode='rb') as bpth:
@@ -263,8 +266,8 @@ class VecTransformDataset(Dataset):
 
             # prepares the set where to choose hold-out items (according to hold-out methods)
             self.hold_out_item_group = {
-                'object': set(self._action_dataset.objects.keys()),
-                'scene': set(self._action_dataset.annotation['action_id'].to_list()),
+                'object_name': list(set(self._action_dataset.objects.keys())),
+                'scene': list(set(self._action_dataset.annotation['scene'].to_list())),
                 'object_type': None,
                 'sample': self.after_vectors.index.to_list()
             }[self.hold_out_procedure]
@@ -276,13 +279,13 @@ class VecTransformDataset(Dataset):
                 self.hold_out_indices = self.hold_out_indices[-self.hold_out_size:]
 
             # creates list of dataset row indices to exclude according to selected hold-out items
-            msk = self._action_dataset.annotation[self.hold_out_procedure] in {self.hold_out_item_group[idx] for idx in self.hold_out_indices}
-            self.train_rows = self.after_vectors[not msk].index
+            # msk = self._action_dataset.annotation[self.hold_out_procedure].map(lambda el: el in {self.hold_out_item_group[idx] for idx in self.hold_out_indices})
+            msk = self._action_dataset.annotation[self.hold_out_procedure].isin({self.hold_out_item_group[idx] for idx in self.hold_out_indices})
+            self.train_rows = self.after_vectors[~msk].index
             self.hold_out_rows = self.after_vectors[msk].index
         else:
             self.hold_out_size = 0
             self.hold_out_rows = pandas.Series([])
-
 
     def __len__(self):
         return len(self.after_vectors)
@@ -291,8 +294,8 @@ class VecTransformDataset(Dataset):
         after_smp = self.after_vectors.iloc[item]
         res = (
             self.before_vectors[after_smp['before_image_path']],
-            after_smp['action_id'].item(),
-            after_smp['vector'].item()
+            self.actions_to_ids[after_smp['action_name']],  # TODO fix issue in ActionDataset to solve also here
+            after_smp['vector']
         )
         return res
 
@@ -329,7 +332,6 @@ class VecTransformDataset(Dataset):
 
         return self.before_vectors, self.after_vectors
 
-
     def split(self, for_regression=False):
         """Splits dataset with the current hold-out settings (defined in initialization). An additional parameter
         allows controlling whether data should be prepared for regression or not.
@@ -344,18 +346,18 @@ class VecTransformDataset(Dataset):
             return train, hold_out
         else:
             train_after_df = self.after_vectors.iloc[self.train_rows]
-            train_after = {action: [] for action in set(self.after_vectors['action_id'].to_list())}
-            train_before = {action: [] for action in set(self.after_vectors['action_id'].to_list())}
+            train_after = {action: [] for action in set(self.actions_to_ids.values())}
+            train_before = {action: [] for action in set(self.actions_to_ids.values())}
             for after_row in train_after_df.iterrows():
-                train_after[after_row['action_id']].append(after_row['vector'])
-                train_before[after_row['action_id']].append(self.before_vectors[after_row['before_image_path']])
+                train_after[self.actions_to_ids[after_row['action_name']]].append(after_row['vector'])
+                train_before[self.actions_to_ids[after_row['action_name']]].append(self.before_vectors[after_row['before_image_path']])
 
             train_after = {action: torch.stack(train_after[action], dim=0) for action in train_after}
             train_before = {action: torch.stack(train_before[action], dim=0) for action in train_after}
             return (train_before, train_after), hold_out
 
-
-
+    def get_vec_size(self):
+        return self.after_vectors.loc[0, 'vector'].shape[-1]
 
 
 class BBoxDataset(torch.utils.data.Dataset):
@@ -466,9 +468,20 @@ class BBoxDataset(torch.utils.data.Dataset):
 
         return self._stats
 
-
     def image_name_from_idx(self, i):
         return self._annotations.loc[i, 'image_name']
+
+
+# Other utilities
+def vect_collate(batch):
+    """
+    :param batch: list of tuples (before-tensor, action-id, after-tensor)
+    :return: a tuple (stacked inputs, stacked actions, stacked outputs)
+    """
+    before = torch.stack([batch[i][0] for i in range(len(batch))], dim=0)
+    actions = torch.tensor([batch[i][1] for i in range(len(batch))], dtype=torch.long)
+    after = torch.stack([batch[i][2] for i in range(len(batch))], dim=0)
+    return before, actions, after
 
 
 def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transform=None, valid_ratio=0.2, **kwargs):
@@ -481,14 +494,22 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
         valid_set = Subset(dataset, indices[sep:])
         train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=default_collate_fn)
         valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=default_collate_fn)
-        return dataset, train_dl, valid_dl
     elif dataset_type == 'actions':
         raise NotImplementedError
     elif dataset_type == 'vect':
-        raise NotImplementedError
+        dataset = VecTransformDataset(path=data_path, override_transform=transform, **kwargs)
+        if dataset.hold_out_procedure == 'none':
+            indices = list(range(len(dataset)))
+            sep = int(len(dataset) * (1 - valid_ratio))
+            train_set = Subset(dataset, indices[:sep])
+            valid_set = Subset(dataset, indices[sep:])
+        else:
+            train_set, valid_set = dataset.split(for_regression=kwargs.get('use_regression', False))
+        train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=vect_collate)
+        valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=vect_collate)
     else:
         raise ValueError(f"unsupported type of dataset '{dataset_type}'")
-
+    return dataset, train_dl, valid_dl
 
 
 if __name__ == "__main__":
