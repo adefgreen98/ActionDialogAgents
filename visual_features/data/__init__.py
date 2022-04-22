@@ -8,6 +8,7 @@ import torch
 
 from pathlib import Path
 
+from matplotlib import use
 from torchvision import transforms
 from collections import defaultdict
 from PIL import Image
@@ -49,6 +50,12 @@ __bbox_target_categories__ = {'CellPhone', 'Pen', 'Towel', 'Candle', 'SoapBar', 
 __nr_bbox_target_categories__ = len(__bbox_target_categories__)
 
 
+__default_dataset_stats__ = {
+    'mean': torch.tensor([0.4689, 0.4682, 0.4712]),
+    'std': torch.tensor([0.2060, 0.2079, 0.2052])
+}  # to rework with full dataset
+
+
 def convert_action(name: str):
     """
     Returns action extended description from action id.
@@ -76,6 +83,8 @@ class ActionDataset(Dataset):
                  **kwargs):
 
         self.path = Path(path)
+
+        self._stats = __default_dataset_stats__
 
         # TODO: drop the (train-)split column and select which (train-)split to use
         # annotations dataframe
@@ -148,12 +157,12 @@ class ActionDataset(Dataset):
         self.annotation['contrast'] = None
         if self.negative_sampling_method == 'fixed_onlyhard':
             contrasts = [
-                self.annotation[lambda df: df['before_image_path'] == before_img].index
+                self.annotation[lambda df: df['before_image_path'] == before_img].index.to_list()
                 for before_img in set(self.annotation['before_image_path'].to_list())
             ]
             for c in contrasts:
                 for img_idx in c:
-                    self.annotation.loc[img_idx, 'contrast'] = [[list(set(c) - {img_idx})]]  # needed 3-dim list for pandas array assignment
+                    self.annotation.at[img_idx, 'contrast'] = list(set(c) - {img_idx})
         elif self.negative_sampling_method == 'random_onlysoft':
             indices = self.annotation.index.to_list()
             for i in range(len(self.annotation)):
@@ -165,7 +174,7 @@ class ActionDataset(Dataset):
                             neg_smp['contrast_set'] == self.annotation.iloc[i]['contrast_set'] and \
                             neg_smp['scene'] != self.annotation.iloc[i]['scene']:
                         c.append(neg_i)
-                self.annotation.loc[i, 'contrast'] = c
+                self.annotation.at[i, 'contrast'] = c
 
     @staticmethod
     def _scene_from_path(p) -> str:
@@ -178,6 +187,18 @@ class ActionDataset(Dataset):
     @staticmethod
     def action_from_path(p) -> str:
         return str(Path(p).parts[-1])[:-4].split("_")[-1]
+
+    def get_stats(self):
+        if self._stats is None:
+            tmp = self.annotation.copy()
+            tmp[lambda df: df['after_image_path'].isnull()]['after_image_path'] = tmp[lambda df: df['after_image_path'].isnull()]['before_image_path']
+            acc = torch.stack([
+                to_tensor(Image.open(pth))
+                for pth in set(self.annotation['after_image_path'].tolist() + self.annotation['before_image_path'])
+            ]).view(3, -1)
+            self._stats = {'mean': acc.mean(dim=-1), 'std': acc.std(dim=-1)}
+
+        return self._stats
 
 
 class VecTransformDataset(Dataset):
@@ -216,11 +237,15 @@ class VecTransformDataset(Dataset):
         :param hold_out_procedure: type of hold out method used (default: None)
         :param hold_out_indices: allows specifying indices of items of the hold-out group that will be selected
         :param randomize_hold_out: whether to randomize creation of the held-out set at the first time, used in combination with hold_out_indices
+        :param use_contrast_set: decide to keep and use contrast sets of the internal ActionDataset (negative sampling can be controlled with additional keyword arguments)
         :param kwargs: keyword arguments for the internal ActionDataset structure
         """
 
+        hold_out_size = int(hold_out_size)
+
         self._action_dataset = ActionDataset(**kwargs, transform=transforms.ToTensor())
         self.extractor_model = extractor_model
+
         self.path = (self._action_dataset.path / 'visual-vectors' / self.extractor_model)
 
         self.actions_to_ids = self._action_dataset.actions_map
@@ -287,16 +312,19 @@ class VecTransformDataset(Dataset):
             self.hold_out_size = 0
             self.hold_out_rows = pandas.Series([])
 
+
     def __len__(self):
         return len(self.after_vectors)
 
     def __getitem__(self, item):
         after_smp = self.after_vectors.iloc[item]
-        res = (
-            self.before_vectors[after_smp['before_image_path']],
-            self.actions_to_ids[after_smp['action_name']],  # TODO fix issue in ActionDataset to solve also here
-            after_smp['vector']
-        )
+        res = {
+            'before': self.before_vectors[after_smp['before_image_path']],
+            'action': self.actions_to_ids[after_smp['action_name']],  # TODO fix issue in ActionDataset to solve also here
+            'positive': after_smp['vector'],
+            'negatives': [self.after_vectors.loc[neg_i, 'vector'] for neg_i in after_smp['contrast']],
+            'neg_actions': [self.actions_to_ids[self.after_vectors.loc[neg_i, 'action_name']] for neg_i in after_smp['contrast']]
+        }
         return res
 
     def preprocess(self):
@@ -310,12 +338,17 @@ class VecTransformDataset(Dataset):
         )
         extractor.eval()
 
-        # Overrides image transformation if needed (e.g. different normalization factors)
-        if self.override_transform is not None:
-            transform = self.override_transform
+        # adjusts transform with dataset statistics
+        if isinstance(transform, transforms.Compose):
+            for t in transform.transforms:
+                if isinstance(t, transforms.Normalize):
+                    t.mean = self._action_dataset.get_stats()['mean']
+                    t.std = self._action_dataset.get_stats()['std']
 
         # excludes 'contrast' column from the action categorization task and adds the 'vector' column
-        self.after_vectors = self._action_dataset.annotation[[c for c in self._action_dataset.annotation.columns if c not in {'contrast'}]].copy()
+        # self.after_vectors = self._action_dataset.annotation[[c for c in self._action_dataset.annotation.columns if c not in {'contrast'}]].copy()
+
+        self.after_vectors = self._action_dataset.annotation.copy()  # also include 'contrast' column (containing contrast set for each sample)
         self.before_vectors = None
 
         def get_vec(pth):
@@ -332,7 +365,7 @@ class VecTransformDataset(Dataset):
 
         return self.before_vectors, self.after_vectors
 
-    def split(self, for_regression=False):
+    def split(self, valid_ratio=-1.0, for_regression=False):
         """Splits dataset with the current hold-out settings (defined in initialization). An additional parameter
         allows controlling whether data should be prepared for regression or not.
         Returns two torch Subset objects that contain samples with the training and the held-out sets."""
@@ -342,8 +375,20 @@ class VecTransformDataset(Dataset):
 
         hold_out = Subset(self, self.hold_out_rows.to_list())
         if not for_regression:
+            assert (0 < valid_ratio < 1) or valid_ratio == -1.0, "choose for validation ratio a value in (0, 1)"
             train = Subset(self, self.train_rows.to_list())
-            return train, hold_out
+            valid_indices = []
+            if valid_ratio > 0:
+                sep = int(len(train) * (1 - valid_ratio))
+                train_indices = list(range(len(train)))[:sep]
+                valid_indices = list(range(len(train)))[sep:]
+
+                train_set = Subset(train, train_indices)
+                valid_set = Subset(train, valid_indices)
+                return train_set, valid_set, hold_out
+            else:
+                valid = Subset(train, [])
+                return train, valid, hold_out
         else:
             train_after_df = self.after_vectors.iloc[self.train_rows]
             train_after = {action: [] for action in set(self.actions_to_ids.values())}
@@ -374,10 +419,7 @@ class BBoxDataset(torch.utils.data.Dataset):
         self.image_extension = image_extension
 
         # TODO: update these values with newer ones
-        self._stats = {
-            'mean': torch.tensor([0.4689, 0.4682, 0.4712]),
-            'std': torch.tensor([0.2060, 0.2079, 0.2052])
-        }
+        self._stats = __default_dataset_stats__
 
         self.transform = transforms.ToTensor() if transform is None else transform
 
@@ -478,9 +520,9 @@ def vect_collate(batch):
     :param batch: list of tuples (before-tensor, action-id, after-tensor)
     :return: a tuple (stacked inputs, stacked actions, stacked outputs)
     """
-    before = torch.stack([batch[i][0] for i in range(len(batch))], dim=0)
-    actions = torch.tensor([batch[i][1] for i in range(len(batch))], dtype=torch.long)
-    after = torch.stack([batch[i][2] for i in range(len(batch))], dim=0)
+    before = torch.stack([batch[i]['before'] for i in range(len(batch))], dim=0)
+    actions = torch.tensor([batch[i]['action'] for i in range(len(batch))], dtype=torch.long)
+    after = torch.stack([batch[i]['positive'] for i in range(len(batch))], dim=0)
     return before, actions, after
 
 
@@ -494,6 +536,7 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
         valid_set = Subset(dataset, indices[sep:])
         train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=default_collate_fn)
         valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=default_collate_fn)
+        test_set = valid_set
     elif dataset_type == 'actions':
         raise NotImplementedError
     elif dataset_type == 'vect':
@@ -503,13 +546,15 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
             sep = int(len(dataset) * (1 - valid_ratio))
             train_set = Subset(dataset, indices[:sep])
             valid_set = Subset(dataset, indices[sep:])
+            test_set = valid_set
         else:
-            train_set, valid_set = dataset.split(for_regression=kwargs.get('use_regression', False))
+            train_set, valid_set, test_set = dataset.split(valid_ratio=valid_ratio, for_regression=kwargs.get('use_regression', False))
         train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=vect_collate)
         valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=vect_collate)
+        test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=vect_collate)  # here for compatibility, but dataset can always be accessed with test_dl.dataset
     else:
         raise ValueError(f"unsupported type of dataset '{dataset_type}'")
-    return dataset, train_dl, valid_dl
+    return dataset, train_dl, valid_dl, test_dl
 
 
 if __name__ == "__main__":

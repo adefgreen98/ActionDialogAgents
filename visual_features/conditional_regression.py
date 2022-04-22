@@ -195,7 +195,7 @@ def run_training(args):
         el.split("|")[0] for el in pandas.read_csv(os.path.join(args.data_path, 'labels.csv'))['object_id']
     }))}
     model, transform = get_model(args, len(obj_dict))
-    full_dataset, train_dl, valid_dl = get_data(args.data_path, batch_size=args.batch_size, dataset_type='bboxes', model_transform=transform)
+    full_dataset, train_dl, valid_dl, _ = get_data(args.data_path, batch_size=args.batch_size, dataset_type='bboxes', model_transform=transform)
     loss = get_loss(args)
     optimizer = get_optimizer(args, model)
     os.makedirs(args.save_path, exist_ok=True)

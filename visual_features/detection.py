@@ -20,7 +20,7 @@ import sys
 sys.path.append('.')  # needed for executing from top directory
 
 from visual_features.visual_baseline import load_model_and_transform, ALLOWED_MODELS
-from visual_features.utils import compute_last_layer_channels, setup_argparser
+from visual_features.utils import compute_last_layer_channels, setup_argparser, get_optimizer
 from visual_features.data import get_data
 
 from visual_features.vision_helper.engine import train_one_epoch, evaluate
@@ -149,26 +149,6 @@ def init_detector(nr_target_categories,
         ).to(device)
     net.device = device
     return net
-
-
-def get_optimizer(args, model):
-    res = None
-    if args.optimizer == 'adamw':
-        res = torch.optim.AdamW(model.parameters(), args.learning_rate)
-    elif args.optimizer == 'adam':
-        res = torch.optim.Adam(model.parameters(), args.learning_rate)
-    elif args.optimizer == 'sgd':
-        res = torch.optim.SGD(model.parameters(), args.learning_rate, momentum=.9, weight_decay=.0005)
-    else:
-        raise ValueError(f'unsupported optimizer ({args.optimizer})')
-
-    res = [res, None]
-    if args.scheduler != 'none':
-        if args.scheduler == 'step':
-            res[1] = torch.optim.lr_scheduler.StepLR(res[0], step_size=3, gamma=0.1)
-        else:
-            raise ValueError(f"unsupported scheduler ({args.scheduler})")
-    return res
 
 
 def get_model(args, nr_target_categories, dataset=None):
@@ -333,7 +313,7 @@ def run_training(args):
     pprint(vars(args))
 
     # Substitute transform for compatibility issues with FasterRCNN (which has its own)
-    full_dataset, train_dl, valid_dl = get_data(args.data_path, batch_size=args.batch_size, dataset_type='bboxes',
+    full_dataset, train_dl, valid_dl, _ = get_data(args.data_path, batch_size=args.batch_size, dataset_type='bboxes',
                                                 transform=torchvision.transforms.ToTensor())
 
     model = get_model(args, len(full_dataset.get_object_set()), dataset=full_dataset)
@@ -363,7 +343,7 @@ def train_all(args):
 
 def debug_evaluation(args):
     # Substitute transform for compatibility issues with FasterRCNN (which has its own)
-    full_dataset, train_dl, valid_dl = get_data(args, transform=torchvision.transforms.ToTensor())
+    full_dataset, train_dl, valid_dl, _ = get_data(args, transform=torchvision.transforms.ToTensor())
 
     model = get_model(args, len(full_dataset.get_object_set()), dataset=full_dataset)
 

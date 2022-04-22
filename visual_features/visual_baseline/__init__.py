@@ -130,6 +130,7 @@ def load_model_and_transform(args, keep_pooling=False, add_flatten=True):
         raise ValueError(f'unsupported model ({args.model_name})')
 
     if transform is None:
+        # default transformation for torchvision models
         transform = torchvision.transforms.Compose([
             torchvision.transforms.Resize(224),
             torchvision.transforms.CenterCrop(224),

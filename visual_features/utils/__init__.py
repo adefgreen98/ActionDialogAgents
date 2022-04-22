@@ -149,6 +149,40 @@ def setup_argparser(config: dict, parser=None):
     return parser
 
 
+def contrasts_find_empty():
+    from visual_features.data import get_data
+    """Outputs 544 samples where the contrast set is empty (except for the only after frame)."""
+    ds = get_data('dataset/data-bbxs/pickupable-held', dataset_type='vect')
+    rows = [el for el in ds.after_vectors.iterrows() if len(el['contrast']) == 0]
+    print([len(ds.after_vectors[lambda df: df['before_image_path'] == row[1]['before_image_path']]) for row in rows])
+
+
+def contrast_check_sanity():
+    from visual_features.data import get_data
+    ds = get_data('dataset/data-bbxs/pickupable-held', dataset_type='vect')
+    contrast_unique_before_images = [set([el['before_image_path'] for el in [row] + [tp[1] for tp in ds.after_vectors.iloc[row['contrast']].iterrows()]]) for _, row in ds.after_vectors.iterrows()]
+    print("checking all contrasts contain exactly 1 before image: ", all([len(c) == 1 for c in contrast_unique_before_images]))  # should contain exactly 1 before image per contrast
+    print("checking number of before images matches exactly the one from the dataset: ", len(set(el for c in contrast_unique_before_images for el in c)))
+
+
+def get_optimizer(args, model):
+    res = None
+    if args.optimizer == 'adamw':
+        res = torch.optim.AdamW(model.parameters(), args.learning_rate)
+    elif args.optimizer == 'adam':
+        res = torch.optim.Adam(model.parameters(), args.learning_rate)
+    elif args.optimizer == 'sgd':
+        res = torch.optim.SGD(model.parameters(), args.learning_rate, momentum=.9, weight_decay=.0005)
+    else:
+        raise ValueError(f'unsupported optimizer ({args.optimizer})')
+
+    res = [res, None]
+    if args.scheduler != 'none':
+        if args.scheduler == 'step':
+            res[1] = torch.optim.lr_scheduler.StepLR(res[0], step_size=3, gamma=0.1)
+        else:
+            raise ValueError(f"unsupported scheduler ({args.scheduler})")
+    return res
 
 if __name__ == '__main__':
     check_moca_maskrcnn()
