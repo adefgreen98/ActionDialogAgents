@@ -88,6 +88,9 @@ def load_model_and_transform(args, keep_pooling=False, add_flatten=True):
         model, transform = clip.load(MODEL_NAMES_MAP[args.model_name], device=args.device, download_root=_clip_download_root)
         model = model.visual
         to_add = list(model.children())
+
+        # NOTE: when using unfrozen CLIP, usually pooling is excluded because adds 4 fully-connected layers for Attentional Pooling
+        # (differently from ImageNet, where the pooling is a simple AveragePool module)
         if not keep_pooling:
             to_add = to_add[:-1]
     elif args.model_name == 'moca-rn':
@@ -100,7 +103,7 @@ def load_model_and_transform(args, keep_pooling=False, add_flatten=True):
         sd = {k.replace('bn1.', 'conv1.1.'): p for k, p in sd.items()}
         sd = {k.replace('conv2.', 'conv2.0.'): p for k, p in sd.items()}
         sd = {k.replace('bn2.', 'conv2.1.'): p for k, p in sd.items()}
-        sd = {k.replace('fc.', 'fc.1.'): p for k, p in sd.items()}
+        sd = {k.replace('fc.', 'fc.1.'): p for k, p in sd.items()}  # NOTE: MOCA is the only one that actually has a final fully-connected, therefore theoretically does not need flattening
         conv_head.load_state_dict(OrderedDict(sd))
 
         if keep_pooling:

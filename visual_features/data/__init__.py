@@ -333,8 +333,8 @@ class VecTransformDataset(Dataset):
 
         extractor, transform = load_model_and_transform(
             Namespace(model_name=self.extractor_model, device='cuda' if torch.cuda.is_available() else 'cpu'),
-            keep_pooling=self.extractor_model != 'clip-rn',
-            add_flatten=False
+            keep_pooling=True,  # self.extractor_model != 'clip-rn',
+            add_flatten=True
         )
         extractor.eval()
 
@@ -403,6 +403,10 @@ class VecTransformDataset(Dataset):
 
     def get_vec_size(self):
         return self.after_vectors.loc[0, 'vector'].shape[-1]
+
+    def get_hold_out_items(self):
+        return set(self.after_vectors.loc[self.hold_out_rows, self.hold_out_procedure].to_list())
+
 
 
 class BBoxDataset(torch.utils.data.Dataset):

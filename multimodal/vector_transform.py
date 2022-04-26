@@ -7,7 +7,7 @@ Open questions
 
 import json
 import os
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from pprint import pprint
 
@@ -40,7 +40,7 @@ class AbstractVectorTransform(ABC, nn.Module):
 
     @abstractmethod
     def __init__(self, actions: set, vec_size: int,
-                 device='cuda', **kwargs):
+                 device='cpu', **kwargs):
         super(AbstractVectorTransform, self).__init__()
         self.actions = actions
         self.nr_actions = len(self.actions)
@@ -55,8 +55,14 @@ class AbstractVectorTransform(ABC, nn.Module):
     def process_batch(self, batch, loss_fn=None):
         pass
 
+    def to(self, *args, **kwargs):
+        self.device = args[0]
+        res = super(AbstractVectorTransform, self).to(*args, **kwargs)
+        # res.device = args[0]
+        return res
 
-__supported_regressions__ = {'torch'}
+
+__supported_regressions__ = {None, 'torch'}
 
 
 class LinearVectorTransform(AbstractVectorTransform):
@@ -74,20 +80,26 @@ class LinearVectorTransform(AbstractVectorTransform):
 
         self.use_regression = use_regression
 
-        self.transforms = nn.ModuleDict({
-            k: nn.Linear(self.vec_size, self.vec_size, bias=False) for k in self.actions
-        })
+        self.weights = nn.Parameter(torch.stack([nn.Linear(self.vec_size, self.vec_size, bias=False).weight.clone().detach() for i in range(self.nr_actions)], dim=0))
+
 
     def forward(self, v, action: str):
         # Normalize vector?
-        return self.transforms[action](v)
+        pred = v.unsqueeze(1).bmm(self.weights.index_select(0, action))
+        return pred.squeeze(1)
 
     def process_batch(self, batch, loss_fn=None):
         # batch --> tuple (before vectors, actions, after vectors)
         before, actions, after = batch
         before = before.to(self.device)
         after = after.to(self.device)
-        pass  # TODO
+        actions = actions.to(self.device)
+        predictions = self(before, actions)
+
+        if self.training and loss_fn is not None:
+            return loss_fn(predictions, after)
+        elif not self.training and loss_fn is None:
+            return predictions, after
 
     def regression_init(self, data: Dict[str, Tuple], regression_type=None):
         # data is a mapping 'action' --> (samples matrix A, target vector B)
@@ -123,7 +135,7 @@ class LinearConcatVecT(AbstractVectorTransform):
         self.__eye_helper = torch.eye(self.nr_actions, device=self.device)
 
         def embed_action(action_batch: torch.LongTensor) -> torch.Tensor:
-            return torch.stack([self.__eye_helper[i].detach().clone() for i in action_batch], dim=0)
+            return torch.stack([self.__eye_helper[i].detach().clone() for i in action_batch], dim=0).to(self.device)
 
         self.embed_action = embed_action
         self.net = nn.Linear(self.nr_actions + self.vec_size, self.vec_size)
@@ -191,8 +203,9 @@ class ConditionalFCNVecT(AbstractVectorTransform):
             # self.embed_actions = nn.Embedding(self.nr_actions, self.nr_actions)  # TODO understand if this works
 
             self.__eye_helper = torch.eye(self.nr_actions, device=self.device)
+
             def embed_action(action_batch: torch.LongTensor) -> torch.Tensor:
-                return torch.stack([self.__eye_helper[i].detach().clone() for i in action_batch.to(self.device)], dim=0)
+                return torch.stack([self.__eye_helper[i].detach().clone() for i in action_batch], dim=0).to(self.device)
 
             self.embed_action = embed_action
 
@@ -304,16 +317,18 @@ def iterate(model: AbstractVectorTransform, dl, optimizer=None, loss_fn=None, mo
             pbar = tqdm(total=len(dl), desc=mode.upper() + "...")
             for i in range(len(dl)):
                 smp = dl[i]  # dict containing 'before', 'action', 'positive', 'negatives', 'neg_actions'
+                if len(smp['negatives']) > 0:  # remove contrast with only 1 positive
+                    before_vec = smp['before'].unsqueeze(0).to(model.device)
+                    action = torch.tensor(smp['action'], dtype=torch.long).unsqueeze(0).to(model.device)
+                    pred = model(before_vec, action).to('cpu')
 
-                pred = model(smp['before'].unsqueeze(0).to(model.device), torch.tensor(smp['action'], dtype=torch.long).unsqueeze(0).to(model.device)).to('cpu')
+                    contrast = torch.stack(smp['negatives'] + [smp['positive']], dim=0)
 
-                contrast = torch.stack(smp['negatives'] + [smp['positive']], dim=0)
+                    # distances = torch.cdist(pred, contrast, p=2.0)
+                    # distances = ((pred - contrast)**2).sum(dim=-1).squeeze()
+                    # distances = torch.norm(pred - contrast, dim=-1)
+                    distances = (1 - torch.cosine_similarity(pred, contrast, dim=-1)) / 2
 
-                # distances = torch.cdist(pred, contrast, p=2.0)
-                # distances = ((pred - contrast)**2).sum(dim=-1).squeeze()
-
-                distances = torch.norm(pred - contrast, dim=-1)
-                if len(distances.shape) > 0:  # remove contrast with only 1 positive
                     correct = torch.argmin(distances, dim=-1).item() == (distances.shape[-1] - 1)  # correct if the positive (last one) is the nearest
                     accuracy_history.append(int(correct))
                 pbar.update()
@@ -345,10 +360,10 @@ _ALLOWED_TRANSFORM_MODULES = {
 
 __default_train_config__ = {
     # General settings
-    'batch_size': (64, ),
-    'learning_rate': (1e-4, ),
+    'batch_size': (128, ),
+    'learning_rate': (1e-3, ),
     'epochs': (20, ),
-    'optimizer': ('adamw', ['adamw', 'adam', 'sgd']),
+    'optimizer': ('adam', ['adamw', 'adam', 'sgd']),
     'scheduler': ('none', ['step', 'none']),
 
     # VecT settings
@@ -396,11 +411,14 @@ def get_model(actions, vec_size, args, **kwargs):
     return _ALLOWED_TRANSFORM_MODULES[args.vect_model](actions, vec_size, **vars(args), **kwargs).to(args.device)
 
 
-def run_training(args, save_results=True, plot=True):
+def run_training(args, fixed_dataset=None, save_results=True, plot=True):
     pprint(vars(args))
 
-    nr_epochs = args.epochs
-    full_dataset, train_dl, valid_dl, test_dl = get_data(**vars(args), dataset_type='vect')
+    nr_epochs = int(args.epochs)
+    if fixed_dataset is None:
+        full_dataset, train_dl, valid_dl, test_dl = get_data(**vars(args), dataset_type='vect')
+    else:
+        full_dataset, train_dl, valid_dl, test_dl = fixed_dataset
     model = get_model(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), args)
     opt, sched = get_optimizer(args, model)
     loss_fn = torch.nn.MSELoss()
@@ -483,32 +501,94 @@ def exp_hold_out(args):
 
     st_path = Path(args.save_path, "statistics")
     os.makedirs(str(st_path), exist_ok=True)
-    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path) if 'hold_out' in name], default=-1) + 1}_hold_out@{args.statistical_iterations}"
-    df = pandas.DataFrame(columns=['extractor_model', 'vect_model', 'hold_out_procedure', 'similarity', 'accuracy'])
-    for hold_out_procedure in ['object_name', 'scene']:
-        for extractor_model in ['moca-rn', 'clip-rn']:
-            for vect_model in ['linear-concat', 'fcn']:
-                args.hold_out_procedure = hold_out_procedure
-                args.extractor_model = extractor_model
-                args.vect_model = vect_model
-                sim, acc, ds = run_training(args, save_results=False, plot=False)
-                df.append({
-                    'hold_out_procedure': hold_out_procedure,
-                    'extractor_model': extractor_model,
-                    'vect_model': vect_model,
-                    'similarity': sim,
-                    'accuracy': acc
-                }, ignore_index=True)
+    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path) if f'hold_out@{args.statistical_iterations}' in name], default=-1) + 1}_hold_out@{args.statistical_iterations}"
+    save_path = st_path / save_name
+    os.makedirs(save_path, exist_ok=True)
 
-                with open(st_path / ("" + save_name + ".txt"), mode='at') as f:
-                    f.write(str(set(ds.after_vectors.loc[ds.hold_out_rows, ds.hold_out_procedure].to_list())) + "\n")
+    # Here for debug
+    # df = {
+    #     'hold_out_procedure': ['a', 'b', 'c', 'd'],
+    #     'extractor_model': [0, 1, 2, 3],
+    #     'vect_model': ['a', 'b', 'c', 'd'],
+    #     'similarity': [0, 1, 2, 3],
+    #     'accuracy': [0, 1, 2, 3]
+    # }
+
+    df = []
+
+    for stat_it in range(args.statistical_iterations):
+        for hold_out_procedure in ['object_name', 'scene']:
+            args.hold_out_procedure = hold_out_procedure
+            fixed_ds = get_data(**vars(args), dataset_type='vect')
+
+            with open(st_path / ("" + save_name + ".txt"), mode='at') as f:
+                f.write(str(fixed_ds[0].get_hold_out_items()) + "\n")
+
+            for extractor_model in ['moca-rn', 'clip-rn']:
+                for vect_model in ['linear', 'linear-concat', 'fcn']:
+
+                    args.extractor_model = extractor_model
+                    args.vect_model = vect_model
+                    sim, acc, ds = run_training(args, fixed_dataset=fixed_ds, save_results=False, plot=False)
+                    df.append({
+                        'hold_out_procedure': hold_out_procedure,
+                        'extractor_model': extractor_model,
+                        'vect_model': vect_model,
+                        'similarity': sim,
+                        'accuracy': acc
+                    })
+
+    df = pandas.DataFrame(df, columns=['extractor_model', 'vect_model', 'hold_out_procedure', 'similarity', 'accuracy'])
+    df.to_csv(save_path / 'results.csv', index=False)
 
     # seaborn.barplot(x='extractor_model', hue='vect_model', data=df)
 
-    g = seaborn.catplot(x='extractor_model', hue='vect_model', data=df, col="hold_out_procedure", kind="bar", height=10, aspect=.75)
+    seaborn.set(font_scale=2)
+    g = seaborn.catplot(x='extractor_model', y='accuracy', hue='vect_model', data=df, col="hold_out_procedure", kind="bar", height=10, aspect=.75)
+    g.savefig(save_path / 'graph.png')
 
-    plt.savefig(Path(args.save_path) / save_name + '.png')
-    df.to_csv(Path(args.save_path) / save_name + '.csv', index=False)
+    return df
+
+
+def exp_fcn_hyperparams(args):
+    args.vect_model = 'fcn'
+    args.statistical_iterations = 1
+
+    hyperparam_options = {
+        'batch_size': [128],
+        'learning_rate': [1e-2],
+        'optimizer': ['adam'],
+        'use_bn': [True, False],
+        'dropout_p': [0.0, 0.7],
+        'extractor_model': ['clip-rn'],
+        'activation': __allowed_activations__
+    }
+    df = []
+
+    from itertools import product
+    print("TOTAL CONFIGS:", len(list(product(*list(hyperparam_options.values())))), f"(* {args.statistical_iterations} iterations)")
+    for i in range(args.statistical_iterations):
+        for cfg in product(*list(hyperparam_options.values())):
+            cfg = {k: cfg[i] for i, k in enumerate(hyperparam_options.keys())}
+            args = vars(args)
+            args.update(cfg)
+            args = Namespace(**args)
+            sim, acc, ds = run_training(args, save_results=False, plot=False)
+            df.append({**cfg, **{'similarity': sim, 'accuracy': acc}})
+    df = pandas.DataFrame(df, columns=list(hyperparam_options.keys()) + ['similarity', 'accuracy'])
+
+    st_path = Path(args.save_path, "statistics")
+    os.makedirs(st_path, exist_ok=True)
+    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path) if f'hyperparams@{args.statistical_iterations}' in name], default=-1) + 1}_hyperparams@{args.statistical_iterations}"
+    os.makedirs(str(st_path / save_name), exist_ok=True)
+    df.to_csv(st_path / save_name / "result.csv", index=False)
+    with open(st_path / save_name / 'best.txt', mode='wt') as f:
+        bst = df.iloc[df['accuracy'].idxmax()].to_dict()
+        pprint(bst, f)
+    return df
+
+
+
 
 
 
@@ -516,17 +596,22 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--exp_hold_out', action='store_true')
+    parser.add_argument('--exp_fcn_hyperparams', action='store_true')
     parser = setup_argparser(__default_train_config__, parser)
     args = parser.parse_args()
 
     if args.train:
         res = run_training(args)
+    elif args.exp_fcn_hyperparams:
+        res = exp_fcn_hyperparams(args)
     elif args.exp_hold_out:
         res = exp_hold_out(args)
     else:
-        full_dataset, _, _, hold_dl = get_data('dataset/data-bbxs/pickupable-held', dataset_type='vect', hold_out_procedure='object_name', hold_out_size=4)
-        model = LinearConcatVecT(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), device='cuda').to('cuda')
-        print(evaluate(model, hold_dl, use_contrasts=True))
+        full_dataset, _, _, hold_dl = get_data('dataset/data-bbxs/pickupable-held', dataset_type='vect', hold_out_procedure='object_name', hold_out_size=4, extractor_model='clip-rn')
+        # model = LinearConcatVecT(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), device='cuda').to('cuda')
+        # print(model)
+        print(full_dataset.after_vectors.loc[0, 'vector'].shape)
+        # print(evaluate(model, hold_dl, use_contrasts=True))
 
 
 
