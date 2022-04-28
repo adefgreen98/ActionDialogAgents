@@ -514,18 +514,24 @@ def exp_hold_out(args):
     #     'accuracy': [0, 1, 2, 3]
     # }
 
-    df = []
+    tested_procedures = ['object_name', 'scene']
+    nr_samples_per_it = {k: [] for k in tested_procedures}
 
+    tested_vect_models = ['linear', 'linear-concat', 'fcn']
+
+    df = []
     for stat_it in range(args.statistical_iterations):
-        for hold_out_procedure in ['object_name', 'scene']:
+        for hold_out_procedure in tested_procedures:
             args.hold_out_procedure = hold_out_procedure
             fixed_ds = get_data(**vars(args), dataset_type='vect')
 
-            with open(st_path / ("" + save_name + ".txt"), mode='at') as f:
+            with open(save_path / 'items.txt', mode='at') as f:
                 f.write(str(fixed_ds[0].get_hold_out_items()) + "\n")
 
+            nr_samples_per_it[hold_out_procedure].append(fixed_ds.get_nr_hold_out_samples())
+
             for extractor_model in ['moca-rn', 'clip-rn']:
-                for vect_model in ['linear', 'linear-concat', 'fcn']:
+                for vect_model in tested_vect_models:
 
                     args.extractor_model = extractor_model
                     args.vect_model = vect_model
@@ -538,6 +544,15 @@ def exp_hold_out(args):
                         'accuracy': acc
                     })
 
+    with open(save_path / 'items.txt', mode='at') as f:
+        f.write(str({
+            'sizes': nr_samples_per_it,
+            'averages': {k: ((sum(el) / len(el)) if len(el) > 0 else 0) for k, el in nr_samples_per_it.items()}
+        }))
+
+    with open(save_path / 'config.json', mode='at') as f:
+        json.dump(vars(args))
+
     df = pandas.DataFrame(df, columns=['extractor_model', 'vect_model', 'hold_out_procedure', 'similarity', 'accuracy'])
     df.to_csv(save_path / 'results.csv', index=False)
 
@@ -545,7 +560,10 @@ def exp_hold_out(args):
 
     seaborn.set(font_scale=2)
     g = seaborn.catplot(x='extractor_model', y='accuracy', hue='vect_model', data=df, col="hold_out_procedure", kind="bar", height=10, aspect=.75)
-    g.savefig(save_path / 'graph.png')
+    g.savefig(save_path / 'stats.png')
+
+    g =  sns.catplot(hue='extractor_model', x='vect_model', y='accuracy', data=df, kind='swarm', col='hold_out_procedure')
+    g.savefig(save_path / 'observations.png')
 
     return df
 

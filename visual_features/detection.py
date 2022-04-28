@@ -26,8 +26,7 @@ from visual_features.data import get_data
 from visual_features.vision_helper.engine import train_one_epoch, evaluate
 from visual_features.bounding_box_utils import compute_iou
 
-_ALLOWED_MODELS = list((set(ALLOWED_MODELS)) - {'all', 'untrained-rn-zero-init'})
-
+_ALLOWED_MODELS = list((set(ALLOWED_MODELS).union({'torchvision-rcnn'})) - {'all', 'untrained-rn-zero-init'})
 
 __default_train_config__ = {
     'batch_size': (32, ),
@@ -40,7 +39,7 @@ __default_train_config__ = {
     'unfreeze': False,
     'add_fpn': False,
 
-    'data_path': ('dataset/data-bbxs/pickupable-held',),
+    'data_path': ('dataset/data-bbxs',),
     'save_model': False,
     'save_path': ('bbox_results', ),
 
@@ -160,12 +159,19 @@ def get_model(args, nr_target_categories, dataset=None):
     if args.model_name not in _ALLOWED_MODELS:
         raise ValueError(f"model named '{args.model_name}' is currently not supported")
 
-    if args.model_name == 'default-rcnn':
+    if args.model_name == 'torchvision-rcnn':
         model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True, image_mean=img_mean, image_std=img_std)
         in_features = model.roi_heads.box_predictor.cls_score.in_features
         model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, nr_target_categories)
     else:
         model = init_detector(nr_target_categories, args.model_name, args.device, use_fpn=args.add_fpn, img_mean=img_mean, img_std=img_std)
+
+    # Be sure that all parameters are trainable
+    if args.model_name != 'torchvision-rcnn':
+        for p in model.parameters():
+            p.requires_grad_(True)
+    else:
+        print("Warning: torchvision-rcnn is too large to be trained in unfrozen setup; skipping unfreezing.")
 
     # Freezing convolutional backbone
     if args.model_name != 'untrained-rn-zero-init' and not args.unfreeze:
@@ -338,7 +344,11 @@ def train_all(args):
     for mname in _ALLOWED_MODELS:
         args.save_path = parent_save_path
         args.model_name = mname
-        _ = wrap_run_training(args)
+        if (args.model_name == 'torchvision-rcnn') and args.unfreeze:
+            # skip this configuration since it is invalid
+            pass
+        else:
+            _ = wrap_run_training(args)
 
 
 def debug_evaluation(args):

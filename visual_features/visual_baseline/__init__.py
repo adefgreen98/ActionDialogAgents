@@ -12,6 +12,9 @@ from argparse import ArgumentParser
 from collections import OrderedDict
 from PIL import Image
 
+import sys
+sys.path.extend(['.', '..'])
+
 from visual_features.data import ActionDataset, \
     convert_action, \
     NEGATIVE_SAMPLING_METHODS as negsamp_choices
@@ -44,9 +47,9 @@ DISTANCE_NAMES_MAP = {
 # UTILITIES
 
 class MOCAVisEnc(nn.Module):
-    '''
+    """
     visual encoder from MOCA
-    '''
+    """
 
     def __init__(self, dframe=147):
         super(MOCAVisEnc, self).__init__()
@@ -190,10 +193,6 @@ def visualize(args, res):
 
 # EVALUATION METHODS
 
-def evaluate_from_disk():
-    pass
-
-
 def evaluate_distance(model,
                       dataset,
                       distance_fn=DISTANCE_NAMES_MAP['cosine']):
@@ -216,60 +215,61 @@ def evaluate_distance(model,
     matrices = {}
 
     with torch.no_grad():
+        for sample in tqdm.tqdm(dataset, total=len(dataset), desc="Evaluating dataset..."):
+            b = torch.stack([sample['before']] + sample['negatives'] + [sample['positive']], dim=0).to(model.device)
+            embs = model(b)
+            distances = distance_fn(embs[0], embs[1:])
+            predicted = torch.argmin(distances, dim=-1).item()
+
+            # Adds if prediction is positive
+            if predicted == distances.shape[-1] - 1:
+                acc_counter += 1
+
+            # Conditional Evaluation
+            if args.conditional_eval:
+                current_actions = sample['neg_actions'] + [sample['action']]  # defines set of actions in current scope
+                actions_set = sorted(list(set(current_actions)), key=int)
+                conditioned_str = ",".join(actions_set)  # identifies uniquely current set of actions
+                if matrices.get(conditioned_str, None) is None:
+                    matrices[conditioned_str] = {
+                        'action_idx': dict([(el, i) for i, el in enumerate(actions_set)]),
+                        # set up an index conversion table for consistency
+                        'matrix': torch.zeros(len(actions_set), len(actions_set), dtype=int)  # create confusion matrix
+                    }
+
+                # Gets action indices and updates confusion matrix
+                pred_idx = matrices[conditioned_str]['action_idx'][current_actions[predicted]]
+                gt_idx = matrices[conditioned_str]['action_idx'][sample['action']]
+                matrices[conditioned_str]['matrix'][gt_idx, pred_idx] += 1
+
         __inverted = True  # check if it gets predicted index 0 by default
+        # if not __inverted:
+        #     for sample in tqdm.tqdm(dataset, total=len(dataset), desc="Evaluating dataset..."):
+        #         b = torch.stack([sample['before'], sample['positive']] + sample['negatives']).to(model.device)
+        #         embs = model(b)
+        #         distances = distance_fn(embs[0], embs[1:])
+        #         predicted = torch.argmin(distances, dim=-1).item()
+        #
+        #         # Adds if prediction is positive
+        #         if predicted == 0:
+        #             acc_counter += 1
+        #
+        #         # Conditional Evaluation
+        #         if args.conditional_eval:
+        #             current_actions = [sample['action']] + sample['neg_actions']  # defines set of actions in current scope
+        #             actions_set = sorted(list(set(current_actions)), key=int)
+        #             conditioned_str = ",".join(actions_set)  # identifies uniquely current set of actions
+        #             if matrices.get(conditioned_str, None) is None:
+        #                 matrices[conditioned_str] = {
+        #                     'action_idx': dict([(el, i) for i, el in enumerate(actions_set)]),  # setup an index conversion table for consistency
+        #                     'matrix': torch.zeros(len(actions_set), len(actions_set), dtype=int)  # create confusion matrix
+        #                 }
+        #
+        #             # Gets action indices and updates confusion matrix
+        #             pred_idx = matrices[conditioned_str]['action_idx'][current_actions[predicted]]
+        #             gt_idx = matrices[conditioned_str]['action_idx'][sample['action']]
+        #             matrices[conditioned_str]['matrix'][gt_idx, pred_idx] += 1
 
-        if not __inverted:
-            for sample in tqdm.tqdm(dataset, total=len(dataset), desc="Evaluating dataset..."):
-                b = torch.stack([sample['before'], sample['positive']] + sample['negatives']).to(model.device)
-                embs = model(b)
-                distances = distance_fn(embs[0], embs[1:])
-                predicted = torch.argmin(distances, dim=-1).item()
-
-                # Adds if prediction is positive
-                if predicted == 0:
-                    acc_counter += 1
-
-                # Conditional Evaluation
-                if args.conditional_eval:
-                    current_actions = [sample['action']] + sample['neg_actions']  # defines set of actions in current scope
-                    actions_set = sorted(list(set(current_actions)), key=int)
-                    conditioned_str = ",".join(actions_set)  # identifies uniquely current set of actions
-                    if matrices.get(conditioned_str, None) is None:
-                        matrices[conditioned_str] = {
-                            'action_idx': dict([(el, i) for i, el in enumerate(actions_set)]),  # setup an index conversion table for consistency
-                            'matrix': torch.zeros(len(actions_set), len(actions_set), dtype=int)  # create confusion matrix
-                        }
-
-                    # Gets action indices and updates confusion matrix
-                    pred_idx = matrices[conditioned_str]['action_idx'][current_actions[predicted]]
-                    gt_idx = matrices[conditioned_str]['action_idx'][sample['action']]
-                    matrices[conditioned_str]['matrix'][gt_idx, pred_idx] += 1
-        else:
-            for sample in tqdm.tqdm(dataset, total=len(dataset), desc="Evaluating dataset..."):
-                b = torch.stack([sample['before']] + sample['negatives'] + [sample['positive']], dim=0).to(model.device)
-                embs = model(b)
-                distances = distance_fn(embs[0], embs[1:])
-                predicted = torch.argmin(distances, dim=-1).item()
-
-                # Adds if prediction is positive
-                if predicted == distances.shape[-1] - 1:
-                    acc_counter += 1
-
-                # Conditional Evaluation
-                if args.conditional_eval:
-                    current_actions = sample['neg_actions'] + [sample['action']]  # defines set of actions in current scope
-                    actions_set = sorted(list(set(current_actions)), key=int)
-                    conditioned_str = ",".join(actions_set)  # identifies uniquely current set of actions
-                    if matrices.get(conditioned_str, None) is None:
-                        matrices[conditioned_str] = {
-                            'action_idx': dict([(el, i) for i, el in enumerate(actions_set)]),  # setup an index conversion table for consistency
-                            'matrix': torch.zeros(len(actions_set), len(actions_set), dtype=int)  # create confusion matrix
-                        }
-
-                    # Gets action indices and updates confusion matrix
-                    pred_idx = matrices[conditioned_str]['action_idx'][current_actions[predicted]]
-                    gt_idx = matrices[conditioned_str]['action_idx'][sample['action']]
-                    matrices[conditioned_str]['matrix'][gt_idx, pred_idx] += 1
 
     s = None
     if args.conditional_eval:
@@ -287,7 +287,7 @@ def evaluate(args):
     model, transform = load_model_and_transform(args)
     dataset = ActionDataset(
         path=args.image_dir,
-        transform=transform,
+        transform=None,
         negative_sampling_method=args.negative_sampling_method, soft_negatives_nr=args.negative_nr
     )
     res = evaluate_distance(model, dataset, distance_fn=DISTANCE_NAMES_MAP[args.distance])
@@ -345,7 +345,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--distance", type=str, choices=list(DISTANCE_NAMES_MAP.keys()), default='cosine')
 
-    parser.add_argument("--image_dir", default='../dataset/pickupable-held')
+    parser.add_argument("--image_dir", default='dataset/data-bbxs')
 
     parser.add_argument('--extract_features', dest='extract_features', action='store_true', default=False)
 
@@ -353,6 +353,7 @@ if __name__ == "__main__":
 
     # Evaluation utilities
     parser.add_argument("--evaluate", dest='evaluate', action='store_true', default=False)
+
     parser.add_argument("--conditional_eval", action='store_true', default=False)
     parser.add_argument("--plot_results", action='store_true', default=False)
     parser.add_argument("--save_results", action='store_true', default=False)
@@ -378,11 +379,11 @@ if __name__ == "__main__":
     else:
         if args.model_name is None:
             while args.model_name is None:
-                args.model_name = input(f"Please provide a model name in {ALLOWED_MODELS + ['all']}: ") \
+                args.model_name = input(f"Please provide a model name in {ALLOWED_MODELS}: ") \
                     if args.model_name not in ALLOWED_MODELS else None
 
         if args.model_name == 'all':
-            to_run = set(ALLOWED_MODELS)
+            to_run = set(ALLOWED_MODELS) - {'all'}
         else:
             to_run = [args.model_name]
 

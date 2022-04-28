@@ -8,6 +8,7 @@ import torch
 
 from pathlib import Path
 
+import torchvision.transforms
 from matplotlib import use
 from torchvision import transforms
 from collections import defaultdict
@@ -68,14 +69,14 @@ def convert_action(name: str):
 
 def rework_annotations_path(df, basepath):
     # TODO: automatic handling of different path specifications
-    df['after_image_path'] = df['after_image_path'].map(lambda pth: str(Path(basepath) / '../..' / pth))
-    df['before_image_path'] = df['before_image_path'].map(lambda pth: str(Path(basepath) / '../..' / pth))
+    df['after_image_path'] = df['after_image_path'].map(lambda pth: str(Path(*basepath.parts[:-1], pth)))
+    df['before_image_path'] = df['before_image_path'].map(lambda pth: str(Path(*basepath.parts[:-1], pth)))
     return df
 
 
 class ActionDataset(Dataset):
     def __init__(self,
-                 path='dataset/data-bbxs/pickupable-held',
+                 path='dataset/data-bbxs',
                  negative_sampling_method='fixed_onlyhard',
                  soft_negatives_nr=2,
                  image_extension='png',
@@ -88,8 +89,8 @@ class ActionDataset(Dataset):
 
         # TODO: drop the (train-)split column and select which (train-)split to use
         # annotations dataframe
-        self.annotation = pandas.read_csv(self.path / '..' / 'bbox-data.csv', index_col=0)
-        self.annotation = rework_annotations_path(self.annotation, self.path)
+        self.annotation = pandas.read_csv(self.path / 'bbox-data.csv', index_col=0)
+        self.annotation = rework_annotations_path(self.annotation, self.path)  # rework paths for mismatch at top directory
         self.annotation.index = pandas.Series(range(len(self.annotation)))  # rework index for consistency
 
         self.image_extension = image_extension
@@ -112,19 +113,20 @@ class ActionDataset(Dataset):
         # self.samples = self._load_samples()
         self._load_negatives()
 
-        # defines default transformation of torchvision models (if not provided)
-        self.transform = transforms.Compose([
-            transforms.Resize(224),
-            transforms.CenterCrop(224),
-            transforms.ToTensor()
-        ]) if transform is None else transform
+        # defines default transformation of torchvision models (if not provided) + normalize with its stats
+        if transform is None:
+            self.transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(self._stats['mean'], self._stats['std'])
+            ])
 
     def __len__(self):
         return len(self.annotation)
 
     def _read_image_from_annotation_path(self, path: str):
-        pth = self.path / Path(*Path(path).parts[-2:])
-        return Image.open(pth)
+        return Image.open(Path(path))
 
     def __getitem__(self, i) -> dict:
         # smp = self.samples[i]
@@ -136,12 +138,17 @@ class ActionDataset(Dataset):
         #     'negatives': [self.transform(Image.open(str(self.path / neg))) for neg in smp['negatives']]  # since negatives may be from a different scene their path should already contain it
         # }
         smp = self.annotation.iloc[i]
+        # try:
+        #
+        # except TypeError:
+        #     print(*[self.annotation.loc[neg_i, 'action_name'] for neg_i in smp['contrast']], sep='\n')
+        #     exit(1)
         res = {
             'positive': self.transform(self._read_image_from_annotation_path(smp['after_image_path'])),
             'before': self.transform(self._read_image_from_annotation_path(smp['before_image_path'])),
             'action': self.actions_map[smp['action_name']],
-            'neg_actions': [self.actions_map[self.annotation.loc[neg_i, 'action_name']] for neg_i in smp['contrast']],
-            'negatives': [self.transform(self._read_image_from_annotation_path(self.annotation.loc[neg_i, 'after_image_path'])) for neg_i in smp['contrast'][0]],
+            'neg_actions': [self.actions_map[ac] for ac in self.annotation.loc[smp['contrast'], 'action_name']],
+            'negatives': [self.transform(self._read_image_from_annotation_path(pth)) for pth in self.annotation.loc[smp['contrast'], 'after_image_path']],
         }
         return res
 
@@ -162,18 +169,20 @@ class ActionDataset(Dataset):
             ]
             for c in contrasts:
                 for img_idx in c:
-                    self.annotation.at[img_idx, 'contrast'] = list(set(c) - {img_idx})
+                    self.annotation.at[img_idx, 'contrast'] = pandas.Index()
         elif self.negative_sampling_method == 'random_onlysoft':
-            indices = self.annotation.index.to_list()
             for i in range(len(self.annotation)):
                 c = []
-                while len(c) < self.soft_negatives_nr:
-                    neg_i = random.sample(indices, k=1)
-                    neg_smp = self.annotation[neg_i]
-                    if neg_i != i and \
-                            neg_smp['contrast_set'] == self.annotation.iloc[i]['contrast_set'] and \
-                            neg_smp['scene'] != self.annotation.iloc[i]['scene']:
-                        c.append(neg_i)
+                msk = (self.annotation['contrast_set'] == self.annotation.loc[i, 'contrast_set']) & \
+                      (self.annotation['scene'] != self.annotation.loc[i, 'scene'])
+                c = self.annotation[msk].sample(self.soft_negatives_nr).index
+                # while len(c) < self.soft_negatives_nr:
+                #     neg_i = random.sample(indices, k=1)
+                #     neg_smp = self.annotation.iloc[neg_i]
+                #     if neg_i != i and \
+                #             neg_smp['contrast_set'].item() == self.annotation.loc[i, 'contrast_set'] and \
+                #             neg_smp['scene'].item() != self.annotation.loc[i, 'scene']:
+                #         c.append(neg_i)
                 self.annotation.at[i, 'contrast'] = c
 
     @staticmethod
@@ -190,11 +199,11 @@ class ActionDataset(Dataset):
 
     def get_stats(self):
         if self._stats is None:
-            tmp = self.annotation.copy()
-            tmp[lambda df: df['after_image_path'].isnull()]['after_image_path'] = tmp[lambda df: df['after_image_path'].isnull()]['before_image_path']
+            # tmp = self.annotation.copy()
+            # tmp[lambda df: df['after_image_path'].isnull()]['after_image_path'] = tmp[lambda df: df['after_image_path'].isnull()]['before_image_path']
             acc = torch.stack([
                 to_tensor(Image.open(pth))
-                for pth in set(self.annotation['after_image_path'].tolist() + self.annotation['before_image_path'])
+                for pth in set(self.annotation['after_image_path'].to_list() + self.annotation['before_image_path'].to_list())
             ]).view(3, -1)
             self._stats = {'mean': acc.mean(dim=-1), 'std': acc.std(dim=-1)}
 
@@ -407,12 +416,15 @@ class VecTransformDataset(Dataset):
     def get_hold_out_items(self):
         return set(self.after_vectors.loc[self.hold_out_rows, self.hold_out_procedure].to_list())
 
+    def get_nr_hold_out_samples(self):
+        return len(self.hold_out_rows)
+
 
 
 class BBoxDataset(torch.utils.data.Dataset):
 
     def __init__(self,
-                 path='dataset/data-bbxs/pickupable-held',
+                 path='dataset/data-bbxs',
                  transform=None,
                  image_extension='png',
                  object_conversion_table=None):
@@ -427,7 +439,7 @@ class BBoxDataset(torch.utils.data.Dataset):
 
         self.transform = transforms.ToTensor() if transform is None else transform
 
-        self._annotations = pandas.read_csv(self.path / '..' / 'bbox-data.csv', index_col=0)
+        self._annotations = pandas.read_csv(self.path / 'bbox-data.csv', index_col=0)
         self._annotations = rework_annotations_path(self._annotations, self.path)
 
         added_before_samples = {}
@@ -451,7 +463,8 @@ class BBoxDataset(torch.utils.data.Dataset):
             name = row['after_image_path'] if row['after_image_path'] is not None else row['before_image_path']
             boxes = row['after_image_bb'] if row['after_image_bb'] is not None else row['before_image_bb']
             boxes = self.tensorize_bbox_from_str(boxes)
-            if not torch.logical_and(boxes[0] < boxes[2], boxes[1] < boxes[3]):
+            if (not torch.logical_and(boxes[0] < boxes[2], boxes[1] < boxes[3])) or \
+                    (not row['visible']):
                 self.excluded_files.append(name)
                 self._annotations.drop(labels=i, axis=0, inplace=True)
 
@@ -540,7 +553,7 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
         valid_set = Subset(dataset, indices[sep:])
         train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=default_collate_fn)
         valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=default_collate_fn)
-        test_set = valid_set
+        test_dl = valid_dl
     elif dataset_type == 'actions':
         raise NotImplementedError
     elif dataset_type == 'vect':
