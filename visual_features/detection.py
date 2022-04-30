@@ -331,11 +331,20 @@ def run_training(args):
 
 def wrap_run_training(args):
     args.save_path = os.path.join(args.save_path, args.model_name)
+
+    restore_fpn = args.fpn
+    if args.model_name == 'clip-rn' and args.unfreeze and not args.use_fpn:
+        print("CLIP: unfrozen configuration requires FPN for memory limitations; adding it automatically")
+        args.use_fpn = True
+
     if args.use_wandb:
         with wandb.init(project=args.project, name=args.model_name, config={k: v for k,v in vars(args).items() if k in __tosave_hyperparams__}):
             model = run_training(args)
     else:
         model = run_training(args)
+
+    args.fpn = restore_fpn
+
     return model
 
 
@@ -344,6 +353,7 @@ def train_all(args):
     for mname in _ALLOWED_MODELS:
         args.save_path = parent_save_path
         args.model_name = mname
+
         if (args.model_name == 'torchvision-rcnn') and args.unfreeze:
             # skip this configuration since it is invalid
             pass

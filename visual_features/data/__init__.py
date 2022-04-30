@@ -169,7 +169,7 @@ class ActionDataset(Dataset):
             ]
             for c in contrasts:
                 for img_idx in c:
-                    self.annotation.at[img_idx, 'contrast'] = pandas.Index()
+                    self.annotation.at[img_idx, 'contrast'] = pandas.Index(set(c) - {img_idx})
         elif self.negative_sampling_method == 'random_onlysoft':
             for i in range(len(self.annotation)):
                 c = []
@@ -383,7 +383,25 @@ class VecTransformDataset(Dataset):
             raise RuntimeError('trying to make the hold out set but no holding out procedure was specified')
 
         hold_out = Subset(self, self.hold_out_rows.to_list())
-        if not for_regression:
+        if for_regression:
+            train_after_df = self.after_vectors.iloc[self.train_rows]
+            train_after = {action: [] for action in set(self.actions_to_ids.values())}
+            train_before = {action: [] for action in set(self.actions_to_ids.values())}
+            for i, after_row in train_after_df.iterrows():
+                train_after[self.actions_to_ids[after_row['action_name']]].append(after_row['vector'])
+                train_before[self.actions_to_ids[after_row['action_name']]].append(self.before_vectors[after_row['before_image_path']])
+
+            for action in train_after:
+                if len(train_after[action]) > 0:
+                    train_after[action] = torch.stack(train_after[action], dim=0)
+                    train_before[action] = torch.stack(train_before[action], dim=0)
+                else:
+                    print(f"Not found samples for action {self.ids_to_actions[action]}, hold out set is {set(self.after_vectors.loc[self.hold_out_indices, self.hold_out_procedure])}")
+                    train_after[action] = torch.tensor([[]], dtype=self.after_vectors.loc[0, 'vector'].dtype, device=self.after_vectors.loc[0, 'vector'].device)
+                    train_before[action] = torch.tensor([[]], dtype=self.after_vectors.loc[0, 'vector'].dtype, device=self.after_vectors.loc[0, 'vector'].device)
+
+            return (train_before, train_after), hold_out
+        else:
             assert (0 < valid_ratio < 1) or valid_ratio == -1.0, "choose for validation ratio a value in (0, 1)"
             train = Subset(self, self.train_rows.to_list())
             valid_indices = []
@@ -398,17 +416,6 @@ class VecTransformDataset(Dataset):
             else:
                 valid = Subset(train, [])
                 return train, valid, hold_out
-        else:
-            train_after_df = self.after_vectors.iloc[self.train_rows]
-            train_after = {action: [] for action in set(self.actions_to_ids.values())}
-            train_before = {action: [] for action in set(self.actions_to_ids.values())}
-            for after_row in train_after_df.iterrows():
-                train_after[self.actions_to_ids[after_row['action_name']]].append(after_row['vector'])
-                train_before[self.actions_to_ids[after_row['action_name']]].append(self.before_vectors[after_row['before_image_path']])
-
-            train_after = {action: torch.stack(train_after[action], dim=0) for action in train_after}
-            train_before = {action: torch.stack(train_before[action], dim=0) for action in train_after}
-            return (train_before, train_after), hold_out
 
     def get_vec_size(self):
         return self.after_vectors.loc[0, 'vector'].shape[-1]
@@ -565,7 +572,12 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
             valid_set = Subset(dataset, indices[sep:])
             test_set = valid_set
         else:
-            train_set, valid_set, test_set = dataset.split(valid_ratio=valid_ratio, for_regression=kwargs.get('use_regression', False))
+            if kwargs.get('use_regression', False):
+                reg_mat, test_set = dataset.split(for_regression=True)
+                test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=vect_collate)
+                return dataset, reg_mat, test_dl
+
+            train_set, valid_set, test_set = dataset.split(valid_ratio=valid_ratio, for_regression=False)
         train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=vect_collate)
         valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=vect_collate)
         test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=vect_collate)  # here for compatibility, but dataset can always be accessed with test_dl.dataset

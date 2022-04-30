@@ -101,8 +101,8 @@ class LinearVectorTransform(AbstractVectorTransform):
         elif not self.training and loss_fn is None:
             return predictions, after
 
-    def regression_init(self, data: Dict[str, Tuple], regression_type=None):
-        # data is a mapping 'action' --> (samples matrix A, target vector B)
+    def regression_init(self, data: Tuple, regression_type=None):
+        # data is a tuple of dicts ({'action' --> samples matrix A}, {'action' --> target vector B})
         # A, B: should be (num. samples, vec_size)
         if self.regression_type is None and regression_type is None:
             raise RuntimeError("unspecified modality of regression for initialization")
@@ -111,12 +111,17 @@ class LinearVectorTransform(AbstractVectorTransform):
             self.regression_type = regression_type
             assert self.regression_type in __supported_regressions__
 
+        train_mat, target_mat = data
+
         if self.regression_type == 'torch':
-            for action in data:
-                sd = OrderedDict({
-                    'weight': torch.linalg.lstsq(data[action][0], data[action][1]).solution
-                })
-                self.transforms[action].load_state_dict(sd)
+            sorted_actions = sorted(train_mat.keys(), key=lambda el: int(el))  # sort action indices
+            weights = []
+            for action in sorted_actions:
+                sol = torch.linalg.lstsq(train_mat[action], target_mat[action]).solution.to(self.device)
+                if sol.numel() == 0:
+                    sol = torch.eye(self.vec_size, device=self.device)
+                weights.append(sol)
+            self.weights = nn.Parameter(torch.stack(weights, dim=0).to(self.device))
         else:
             pass  # TODO
 
@@ -383,7 +388,7 @@ __default_train_config__ = {
     'statistical_iterations': (5, ),
 
     # Others
-    'data_path': ('dataset/data-bbxs/pickupable-held',),
+    'data_path': ('dataset/data-bbxs',),
     'save_model': False,
     'save_path': ('VECT_results', ),
 
@@ -521,19 +526,20 @@ def exp_hold_out(args):
 
     df = []
     for stat_it in range(args.statistical_iterations):
-        for hold_out_procedure in tested_procedures:
-            args.hold_out_procedure = hold_out_procedure
-            fixed_ds = get_data(**vars(args), dataset_type='vect')
+        for extractor_model in ['moca-rn', 'clip-rn']:
+            for hold_out_procedure in tested_procedures:
+                args.hold_out_procedure = hold_out_procedure
+                args.extractor_model = extractor_model
 
-            with open(save_path / 'items.txt', mode='at') as f:
-                f.write(str(fixed_ds[0].get_hold_out_items()) + "\n")
+                # needed both to fix the dataset
+                fixed_ds = get_data(**vars(args), dataset_type='vect')
 
-            nr_samples_per_it[hold_out_procedure].append(fixed_ds.get_nr_hold_out_samples())
+                with open(save_path / 'items.txt', mode='at') as f:
+                    f.write(str(fixed_ds[0].get_hold_out_items()) + "\n")
 
-            for extractor_model in ['moca-rn', 'clip-rn']:
+                nr_samples_per_it[hold_out_procedure].append(fixed_ds[0].get_nr_hold_out_samples())
+
                 for vect_model in tested_vect_models:
-
-                    args.extractor_model = extractor_model
                     args.vect_model = vect_model
                     sim, acc, ds = run_training(args, fixed_dataset=fixed_ds, save_results=False, plot=False)
                     df.append({
@@ -562,7 +568,7 @@ def exp_hold_out(args):
     g = seaborn.catplot(x='extractor_model', y='accuracy', hue='vect_model', data=df, col="hold_out_procedure", kind="bar", height=10, aspect=.75)
     g.savefig(save_path / 'stats.png')
 
-    g =  sns.catplot(hue='extractor_model', x='vect_model', y='accuracy', data=df, kind='swarm', col='hold_out_procedure')
+    g = seaborn.catplot(hue='extractor_model', x='vect_model', y='accuracy', data=df, kind='swarm', col='hold_out_procedure')
     g.savefig(save_path / 'observations.png')
 
     return df
@@ -606,8 +612,101 @@ def exp_fcn_hyperparams(args):
     return df
 
 
+def run_train_regression(args, fixed_dataset=None, save_results=False):
+
+    # Prepares path for saving
+    pth = Path(args.save_path, "+".join([args.vect_model, args.extractor_model]))
+    new_idx = str(max([int(el) for el in os.listdir(pth) if el.isdigit()], default=-1) + 1) if os.path.exists(pth) else '0'
+    pth = pth / new_idx
+
+    if fixed_dataset is not None:
+        full_dataset, reg_matrices, test_dl = fixed_dataset
+    else:
+        full_dataset, reg_matrices, test_dl = get_data(**vars(args), dataset_type='vect', use_regression=True)
+
+    model = get_model(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), args)
+    model.regression_init(reg_matrices, regression_type='torch')
+
+    print(f"------ TEST ------")
+    test_res = evaluate(model, test_dl, use_contrasts=True)
+    test_sim, test_acc = round(test_res[0].mean(dim=-1).item(), 4), round(test_res[1].mean(dim=-1).item(), 4)
+    print("Test sim: ", test_sim)
+    print("Test acc: ", test_acc)
+    print()
+
+    if save_results:
+        os.makedirs(pth, exist_ok=True)
+
+        with open(pth / 'config.json', mode='wt') as f:
+            json.dump(vars(args), f)
+
+        pandas.DataFrame({
+            'similarity': test_sim,
+            'accuracy': test_acc,
+            # TODO: what other metrics?
+            # 'time': -1.0
+        }).to_csv(str(pth / 'metrics.csv'), index=False)
+
+    return test_sim, test_acc, full_dataset  # to register hold-out items
 
 
+def exp_regression(args):
+    tested_procedures = ['object_name', 'scene']
+
+    args.vect_model = 'linear'
+    args.use_regression = True
+
+    st_path = Path(args.save_path, "regression")
+    os.makedirs(str(st_path), exist_ok=True)
+
+    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path) if f'stats@{args.statistical_iterations}' in name], default=-1) + 1}_stats@{args.statistical_iterations}"
+    save_path = st_path / save_name
+    os.makedirs(save_path, exist_ok=True)
+
+    nr_samples_per_it = {k: [] for k in tested_procedures}
+    df = []
+    for stat_it in range(args.statistical_iterations):
+        for extractor_model in ['moca-rn', 'clip-rn']:
+            for hold_out_procedure in tested_procedures:
+                args.hold_out_procedure = hold_out_procedure
+                args.extractor_model = extractor_model
+
+                pprint({
+                    'extractor_model': args.extractor_model,
+                    'hold-out': args.hold_out_procedure
+                })
+
+                # needed both to fix the dataset
+                fixed_ds = get_data(**vars(args), dataset_type='vect')
+
+                with open(save_path / 'items.txt', mode='at') as f:
+                    f.write(str(fixed_ds[0].get_hold_out_items()) + "\n")
+
+                nr_samples_per_it[hold_out_procedure].append(fixed_ds[0].get_nr_hold_out_samples())
+
+                sim, acc, ds = run_train_regression(args, fixed_dataset=fixed_ds, save_results=False)
+                df.append({
+                    'hold_out_procedure': hold_out_procedure,
+                    'extractor_model': extractor_model,
+                    'similarity': sim,
+                    'accuracy': acc
+                })
+
+    with open(save_path / 'items.txt', mode='at') as f:
+        f.write(str({
+            'sizes': nr_samples_per_it,
+            'averages': {k: ((sum(el) / len(el)) if len(el) > 0 else 0) for k, el in nr_samples_per_it.items()}
+        }))
+
+    df = pandas.DataFrame(df, columns=['extractor_model', 'vect_model', 'hold_out_procedure', 'similarity', 'accuracy'])
+    df.to_csv(save_path / 'results.csv', index=False)
+
+    seaborn.set(font_scale=2)
+    g = seaborn.catplot(x='vect_model', y='accuracy', hue='extractor_model', data=df, col="hold_out_procedure", kind="bar", height=10, aspect=.75)
+    g.savefig(save_path / 'stats.png')
+
+    # g = seaborn.catplot(hue='extractor_model', x='vect_model', y='accuracy', data=df, kind='swarm', col='hold_out_procedure')
+    # g.savefig(save_path / 'observations.png')
 
 
 if __name__ == '__main__':
@@ -615,6 +714,7 @@ if __name__ == '__main__':
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--exp_hold_out', action='store_true')
     parser.add_argument('--exp_fcn_hyperparams', action='store_true')
+    parser.add_argument('--exp_regression', action='store_true')
     parser = setup_argparser(__default_train_config__, parser)
     args = parser.parse_args()
 
@@ -624,6 +724,8 @@ if __name__ == '__main__':
         res = exp_fcn_hyperparams(args)
     elif args.exp_hold_out:
         res = exp_hold_out(args)
+    elif args.exp_regression:
+        res = exp_regression(args)
     else:
         full_dataset, _, _, hold_dl = get_data('dataset/data-bbxs/pickupable-held', dataset_type='vect', hold_out_procedure='object_name', hold_out_size=4, extractor_model='clip-rn')
         # model = LinearConcatVecT(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), device='cuda').to('cuda')
