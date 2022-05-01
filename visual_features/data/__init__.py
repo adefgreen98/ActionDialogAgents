@@ -17,6 +17,8 @@ from torch.utils.data import Dataset, Subset
 from torchvision.transforms.functional import to_tensor
 from tqdm import tqdm
 
+from torch.nn.utils.rnn import pad_sequence
+
 import sys
 sys.path.extend(['..', '.'])
 
@@ -253,6 +255,8 @@ class VecTransformDataset(Dataset):
         hold_out_size = int(hold_out_size)
 
         self._action_dataset = ActionDataset(**kwargs, transform=transforms.ToTensor())
+        self.non_empty_contrasts = self._action_dataset.annotation['before_image_path'].map(lambda el: len(self._action_dataset.annotation[self._action_dataset.annotation['before_image_path'] == el]) != 1)
+
         self.extractor_model = extractor_model
 
         self.path = (self._action_dataset.path / 'visual-vectors' / self.extractor_model)
@@ -315,11 +319,12 @@ class VecTransformDataset(Dataset):
             # creates list of dataset row indices to exclude according to selected hold-out items
             # msk = self._action_dataset.annotation[self.hold_out_procedure].map(lambda el: el in {self.hold_out_item_group[idx] for idx in self.hold_out_indices})
             msk = self._action_dataset.annotation[self.hold_out_procedure].isin({self.hold_out_item_group[idx] for idx in self.hold_out_indices})
-            self.train_rows = self.after_vectors[~msk].index
-            self.hold_out_rows = self.after_vectors[msk].index
+            self.train_rows = self.after_vectors[(~msk) & self.non_empty_contrasts].index
+            self.hold_out_rows = self.after_vectors[msk & self.non_empty_contrasts].index
         else:
             self.hold_out_size = 0
             self.hold_out_rows = pandas.Series([])
+            self.train_rows = self.after_vectors[self.non_empty_contrasts].index
 
 
     def __len__(self):
@@ -541,13 +546,37 @@ class BBoxDataset(torch.utils.data.Dataset):
 # Other utilities
 def vect_collate(batch):
     """
-    :param batch: list of tuples (before-tensor, action-id, after-tensor)
+    :param batch: list of dicts containing 'before' tensor, 'action' id, 'positive' after tensor
     :return: a tuple (stacked inputs, stacked actions, stacked outputs)
     """
     before = torch.stack([batch[i]['before'] for i in range(len(batch))], dim=0)
     actions = torch.tensor([batch[i]['action'] for i in range(len(batch))], dtype=torch.long)
     after = torch.stack([batch[i]['positive'] for i in range(len(batch))], dim=0)
     return before, actions, after
+
+
+def siamese_collate(batch):
+    """
+    :param batch: list of dicts containing 'before' --> tensor, 'action' --> id, 'positive' --> after tensor, 'negatives' --> list of tensors, 'neg_actions' --> list of action ids for negatives
+    :return: a tuple (stacked befores, stacked positives, stacked postive actions, batch of stacked negatives, batch of stacked neg-actions)
+    """
+    # TODO produce mask and perform padding
+    res = {
+        'before': torch.stack([batch[i]['before'] for i in range(len(batch))], dim=0),
+        'action': torch.tensor([batch[i]['action'] for i in range(len(batch))], dtype=torch.long),
+        'positive': torch.stack([batch[i]['positive'] for i in range(len(batch))], dim=0),
+        'neg_actions': pad_sequence([torch.tensor(batch[i]['neg_actions'], dtype=torch.long) for i in range(len(batch))], batch_first=True, padding_value=-1),
+        'negatives': pad_sequence([torch.stack(batch[i]['negatives'], dim=0) for i in range(len(batch))], batch_first=True, padding_value=0)
+    }
+    # negs = []
+    # for i in range(len(batch)):
+    #     negs.append(torch.stack(batch[i]['negatives'], dim=0))
+    #     print(negs[-1].shape)
+    # res['negatives'] = pad_sequence(negs, batch_first=True, padding_value=0)
+    res['mask'] = (res['neg_actions'] >= 0).float()
+    return res
+
+
 
 
 def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transform=None, valid_ratio=0.2, **kwargs):
@@ -578,9 +607,10 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
                 return dataset, reg_mat, test_dl
 
             train_set, valid_set, test_set = dataset.split(valid_ratio=valid_ratio, for_regression=False)
-        train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=vect_collate)
+
+        train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=siamese_collate if kwargs.get('use_siamese', False) else vect_collate)
         valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=vect_collate)
-        test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=vect_collate)  # here for compatibility, but dataset can always be accessed with test_dl.dataset
+        test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=vect_collate)  # here for compatibility, but dataset will be accessed with test_dl.dataset
     else:
         raise ValueError(f"unsupported type of dataset '{dataset_type}'")
     return dataset, train_dl, valid_dl, test_dl

@@ -65,6 +65,20 @@ class AbstractVectorTransform(ABC, nn.Module):
 __supported_regressions__ = {None, 'torch'}
 
 
+def siamese_train_step(model: AbstractVectorTransform, batch, alpha=1.0):
+    bs, contrast_size, vec_size = batch['negatives'].shape
+    contrast_size = contrast_size + 1  # add positive
+    pred = model(batch['before'].to(model.device), batch['action'].to(model.device))
+    contrasts = torch.cat((batch['negatives'], batch['positive'].unsqueeze(-2)), dim=-2)
+    distances = torch.cdist(contrasts.to(model.device), pred.unsqueeze(-2)).view(bs, contrast_size).to('cpu')
+    coeff = torch.ones_like(distances) * torch.cat((batch['mask'], torch.ones(bs, 1)), dim=-1)
+    coeff[:, :-1] *= -1  # all negatives except for the last positive
+    triplet_losses = torch.sum(distances * coeff, dim=-1)
+    loss = triplet_losses[triplet_losses > 0].mean(dim=0)
+    return loss
+
+
+
 class LinearVectorTransform(AbstractVectorTransform):
     """Module implementing vector transformation as matrix multiplication. Can also be initialized with a least-squares
     regression procedure."""
@@ -294,13 +308,16 @@ class PolyFCNVecT(AbstractVectorTransform):
         pass  # TODO
 
 
-def iterate(model: AbstractVectorTransform, dl, optimizer=None, loss_fn=None, mode='eval'):
+def iterate(model: AbstractVectorTransform, dl, optimizer=None, loss_fn=None, mode='eval', siamese=False):
     if mode == 'train':
         model.train()
         loss_history = []
         for batch in tqdm(dl, desc=mode.upper() + "..."):
-            loss = model.process_batch(batch, loss_fn)
             optimizer.zero_grad()
+            if siamese:
+                loss = siamese_train_step(model, batch)
+            else:
+                loss = model.process_batch(batch, loss_fn)
             loss.backward()
             optimizer.step()
             loss_history.append(loss.item())
@@ -343,8 +360,8 @@ def iterate(model: AbstractVectorTransform, dl, optimizer=None, loss_fn=None, mo
 
 
 
-def train(*args):
-    return iterate(*args, mode='train')
+def train(*args, siamese=False):
+    return iterate(*args, mode='train', siamese=siamese)
 
 
 def evaluate(model, dl, use_contrasts=False):
@@ -377,6 +394,7 @@ __default_train_config__ = {
     'dropout_p': (0.0, [0.0, 0.3, 0.5, 0.7, 0.9]),
     'activation': ('none', __allowed_activations__),
     'hidden_sizes': (None, ),
+    'use_siamese': False,
 
     # Dataset settings
     'extractor_model': ('moca-rn', _ALLOWED_MODELS),
@@ -408,7 +426,8 @@ __tosave_hyperparams__ = [
     'dropout_p',
     'activation',
     'extractor_model',
-    'use_regression'
+    'use_regression',
+    'use_siamese'
 ]
 
 
@@ -424,6 +443,12 @@ def run_training(args, fixed_dataset=None, save_results=True, plot=True):
         full_dataset, train_dl, valid_dl, test_dl = get_data(**vars(args), dataset_type='vect')
     else:
         full_dataset, train_dl, valid_dl, test_dl = fixed_dataset
+
+    print(len(full_dataset._action_dataset.annotation))
+    print(len(full_dataset.train_rows))
+    print(len(full_dataset.hold_out_rows))
+    print(len(full_dataset.non_empty_contrasts[full_dataset.non_empty_contrasts]))
+
     model = get_model(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), args)
     opt, sched = get_optimizer(args, model)
     loss_fn = torch.nn.MSELoss()
@@ -432,6 +457,7 @@ def run_training(args, fixed_dataset=None, save_results=True, plot=True):
     ep_acc_mean = []
 
     # Prepares path for saving
+    args.vect_model = args.vect_model + ('siamese' if args.use_siamese else '')
     pth = Path(args.save_path, "+".join([args.vect_model, args.extractor_model]))
     new_idx = str(max([int(el) for el in os.listdir(pth) if el.isdigit()], default=-1) + 1) if os.path.exists(pth) else '0'
     pth = pth / new_idx
@@ -441,7 +467,7 @@ def run_training(args, fixed_dataset=None, save_results=True, plot=True):
         print("EPOCH", ep + 1, "/", nr_epochs)
 
         # Training
-        ep_loss_mean.append(round(train(model, train_dl, opt, loss_fn).mean(dim=0).item(), 4))
+        ep_loss_mean.append(round(train(model, train_dl, opt, loss_fn, siamese=args.use_siamese).mean(dim=0).item(), 4))
         print("Train loss: ", ep_loss_mean[-1])
 
         # Validation
@@ -504,9 +530,9 @@ def exp_hold_out(args):
     Supposing contrasts of hard-negatives (i.e. same object, same scene) each contrast set appears wholly either in the
     seen or in the unseen split; instead, for train and validation samples from the same contrast may be put in different splits."""
 
-    st_path = Path(args.save_path, "statistics")
+    st_path = Path(args.save_path, "statistics", "hold-out")
     os.makedirs(str(st_path), exist_ok=True)
-    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path) if f'hold_out@{args.statistical_iterations}' in name], default=-1) + 1}_hold_out@{args.statistical_iterations}"
+    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path)], default=-1) + 1}_@{args.statistical_iterations}"
     save_path = st_path / save_name
     os.makedirs(save_path, exist_ok=True)
 
@@ -545,7 +571,7 @@ def exp_hold_out(args):
                     df.append({
                         'hold_out_procedure': hold_out_procedure,
                         'extractor_model': extractor_model,
-                        'vect_model': vect_model,
+                        'vect_model': args.vect_model,
                         'similarity': sim,
                         'accuracy': acc
                     })
@@ -557,12 +583,10 @@ def exp_hold_out(args):
         }))
 
     with open(save_path / 'config.json', mode='at') as f:
-        json.dump(vars(args))
+        json.dump(vars(args), f)
 
     df = pandas.DataFrame(df, columns=['extractor_model', 'vect_model', 'hold_out_procedure', 'similarity', 'accuracy'])
     df.to_csv(save_path / 'results.csv', index=False)
-
-    # seaborn.barplot(x='extractor_model', hue='vect_model', data=df)
 
     seaborn.set(font_scale=2)
     g = seaborn.catplot(x='extractor_model', y='accuracy', hue='vect_model', data=df, col="hold_out_procedure", kind="bar", height=10, aspect=.75)
@@ -601,9 +625,9 @@ def exp_fcn_hyperparams(args):
             df.append({**cfg, **{'similarity': sim, 'accuracy': acc}})
     df = pandas.DataFrame(df, columns=list(hyperparam_options.keys()) + ['similarity', 'accuracy'])
 
-    st_path = Path(args.save_path, "statistics")
+    st_path = Path(args.save_path, "statistics", "hyperparams")
     os.makedirs(st_path, exist_ok=True)
-    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path) if f'hyperparams@{args.statistical_iterations}' in name], default=-1) + 1}_hyperparams@{args.statistical_iterations}"
+    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path)], default=-1) + 1}_@{args.statistical_iterations}"
     os.makedirs(str(st_path / save_name), exist_ok=True)
     df.to_csv(st_path / save_name / "result.csv", index=False)
     with open(st_path / save_name / 'best.txt', mode='wt') as f:
@@ -615,9 +639,11 @@ def exp_fcn_hyperparams(args):
 def run_train_regression(args, fixed_dataset=None, save_results=False):
 
     # Prepares path for saving
-    pth = Path(args.save_path, "+".join([args.vect_model, args.extractor_model]))
+    pth = Path(args.save_path, "models", "+".join([args.vect_model, args.extractor_model]))
+    os.makedirs(pth, exist_ok=True)
     new_idx = str(max([int(el) for el in os.listdir(pth) if el.isdigit()], default=-1) + 1) if os.path.exists(pth) else '0'
     pth = pth / new_idx
+    os.makedirs(exist_ok=True)
 
     if fixed_dataset is not None:
         full_dataset, reg_matrices, test_dl = fixed_dataset
@@ -689,7 +715,8 @@ def exp_regression(args):
                     'hold_out_procedure': hold_out_procedure,
                     'extractor_model': extractor_model,
                     'similarity': sim,
-                    'accuracy': acc
+                    'accuracy': acc,
+                    'vect_model': args.vect_model
                 })
 
     with open(save_path / 'items.txt', mode='at') as f:
@@ -707,6 +734,7 @@ def exp_regression(args):
 
     # g = seaborn.catplot(hue='extractor_model', x='vect_model', y='accuracy', data=df, kind='swarm', col='hold_out_procedure')
     # g.savefig(save_path / 'observations.png')
+
 
 
 if __name__ == '__main__':
@@ -727,7 +755,7 @@ if __name__ == '__main__':
     elif args.exp_regression:
         res = exp_regression(args)
     else:
-        full_dataset, _, _, hold_dl = get_data('dataset/data-bbxs/pickupable-held', dataset_type='vect', hold_out_procedure='object_name', hold_out_size=4, extractor_model='clip-rn')
+        full_dataset, _, _, hold_dl = get_data('dataset/data-bbxs', dataset_type='vect', hold_out_procedure='object_name', hold_out_size=4, extractor_model='clip-rn')
         # model = LinearConcatVecT(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), device='cuda').to('cuda')
         # print(model)
         print(full_dataset.after_vectors.loc[0, 'vector'].shape)
