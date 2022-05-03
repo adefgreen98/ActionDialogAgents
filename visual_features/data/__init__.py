@@ -385,7 +385,7 @@ class VecTransformDataset(Dataset):
         Returns two torch Subset objects that contain samples with the training and the held-out sets."""
 
         if self.hold_out_procedure == 'none':
-            raise RuntimeError('trying to make the hold out set but no holding out procedure was specified')
+            print("Warning: no holding out procedure specified, so test set and validation set will coincide")
 
         hold_out = Subset(self, self.hold_out_rows.to_list())
         if for_regression:
@@ -417,6 +417,10 @@ class VecTransformDataset(Dataset):
 
                 train_set = Subset(train, train_indices)
                 valid_set = Subset(train, valid_indices)
+
+                if self.hold_out_procedure == 'none':
+                    hold_out = valid_set
+
                 return train_set, valid_set, hold_out
             else:
                 valid = Subset(train, [])
@@ -594,19 +598,12 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
         raise NotImplementedError
     elif dataset_type == 'vect':
         dataset = VecTransformDataset(path=data_path, override_transform=transform, **kwargs)
-        if dataset.hold_out_procedure == 'none':
-            indices = list(range(len(dataset)))
-            sep = int(len(dataset) * (1 - valid_ratio))
-            train_set = Subset(dataset, indices[:sep])
-            valid_set = Subset(dataset, indices[sep:])
-            test_set = valid_set
-        else:
-            if kwargs.get('use_regression', False):
-                reg_mat, test_set = dataset.split(for_regression=True)
-                test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=vect_collate)
-                return dataset, reg_mat, test_dl
+        if kwargs.get('use_regression', False):
+            reg_mat, test_set = dataset.split(for_regression=True)
+            test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=vect_collate)
+            return dataset, reg_mat, test_dl
 
-            train_set, valid_set, test_set = dataset.split(valid_ratio=valid_ratio, for_regression=False)
+        train_set, valid_set, test_set = dataset.split(valid_ratio=valid_ratio, for_regression=False)
 
         train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=siamese_collate if kwargs.get('use_siamese', False) else vect_collate)
         valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=vect_collate)
