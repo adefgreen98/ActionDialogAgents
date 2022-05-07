@@ -114,16 +114,12 @@ def load_model_from_path(parent_path, nr=None, name=None, device='cuda'):
     return model
 
 
-def valtype(s):
-    if isinstance(s, str) and not ((s.isalpha()) or ('-' in s) or ('_' in s)):
-        try:
-            s = int(s)
-        except ValueError:
-            try:
-                s = float(s)
-            except ValueError:
-                raise ValueError(f"unrecognized type for {s}")
-    return type(s)
+def valtype(v):
+    s = str(v)
+    try:
+        return type(eval(s))
+    except NameError:
+        return str
 
 
 def setup_argparser(config: dict, parser=None):

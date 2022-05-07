@@ -14,3 +14,5 @@
 /visual_features/old/
 *.zip
 /local_dataset/
+/visual_features/data/_old_data.py
+/new-dataset/

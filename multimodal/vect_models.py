@@ -21,9 +21,20 @@ class AbstractVectorTransform(ABC, nn.Module):
     def forward(self, v, action):
         pass
 
-    @abstractmethod
     def process_batch(self, batch, loss_fn=None):
-        pass
+        before, actions, after = batch
+        before = before.to(self.device)
+        actions = actions.to(self.device).long()
+        after = after.to(self.device)
+
+        predictions = self(before, actions)
+
+        if self.training and loss_fn is not None:
+            return loss_fn(predictions, after)
+        elif not self.training and loss_fn is None:
+            if len(after.shape) == 2:
+                after.unsqueeze_(0)  # adding fake contrast dimension (for computing distance)
+            return predictions, after
 
     def to(self, *args, **kwargs):
         self.device = args[0]
@@ -57,19 +68,6 @@ class LinearVectorTransform(AbstractVectorTransform):
         # Normalize vector?
         pred = v.unsqueeze(1).bmm(self.weights.index_select(0, action))
         return pred.squeeze(1)
-
-    def process_batch(self, batch, loss_fn=None):
-        # batch --> tuple (before vectors, actions, after vectors)
-        before, actions, after = batch
-        before = before.to(self.device)
-        after = after.to(self.device)
-        actions = actions.to(self.device)
-        predictions = self(before, actions)
-
-        if self.training and loss_fn is not None:
-            return loss_fn(predictions, after)
-        elif not self.training and loss_fn is None:
-            return predictions, after
 
     def regression_init(self, data: Tuple, regression_type=None):
         # data is a tuple of dicts ({'action' --> samples matrix A}, {'action' --> target vector B})
@@ -119,18 +117,6 @@ class LinearConcatVecT(AbstractVectorTransform):
         embedded = self.embed_action(action)
         return self.net(torch.cat((v, embedded), dim=-1))
 
-    def process_batch(self, batch, loss_fn=None):
-        before, actions, after = batch
-        before = before.to(self.device)
-        actions = actions.to(self.device).long()
-        after = after.to(self.device)
-
-        predictions = self(before, actions)
-
-        if self.training and loss_fn is not None:
-            return loss_fn(predictions, after)
-        elif not self.training and loss_fn is None:
-            return predictions, after
 
 
 __allowed_conditioning_methods__ = ['concat']
@@ -200,18 +186,6 @@ class ConditionalFCNVecT(AbstractVectorTransform):
     def forward(self, v, action):
         return self.net(torch.cat([v, self.embed_action(action)], dim=-1))
 
-    def process_batch(self, batch, loss_fn=None):
-        before, actions, after = batch
-        before = before.to(self.device)
-        actions = actions.to(self.device).long()
-        after = after.to(self.device)
-
-        predictions = self(before, actions)
-
-        if self.training and loss_fn is not None:
-            return loss_fn(predictions, after)
-        elif not self.training and loss_fn is None:
-            return predictions, after
 
 
 class PolyFCNVecT(AbstractVectorTransform):

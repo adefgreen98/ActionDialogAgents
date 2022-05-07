@@ -1,9 +1,3 @@
-"""
-Open questions
-- end to end framework?
-- unique nn model for each action?
-- Alternative to pytorch decomposition: https://scikit-learn.org/stable/modules/generated/sklearn.cross_decomposition.PLSRegression.html
-"""
 
 import json
 import os
@@ -17,6 +11,7 @@ import seaborn
 
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from abc import ABC, abstractmethod
 from typing import Tuple
 from collections import OrderedDict
@@ -36,42 +31,67 @@ from multimodal.vect_models import *
 from multimodal.vect_models import __allowed_activations__ as allowed_activations
 
 
-def old_siamese_train_step(model: AbstractVectorTransform, batch, alpha=1.0):
+def compute_embedding_distance(contrasts, pred):
+    """
+    Computes distance between embeddings of a contrast (in the form [negative1, negative2, ...., positive]) and a prediction.
+    :param contrasts: Tensor of size (batch-size, contrast-size, vector size); note that contrast-size is equivalent to number of negatives plus 1 for the positive
+    :param pred: Tensor of size (batch-size, vector size)
+    """
+    bs = contrasts.shape[0]
+    contrast_size = contrasts.shape[1]
+    assert len(pred.shape) == 2 and pred.shape[0] == bs, f"Prediction {pred.shape}, Contrast {contrasts.shape}"
+    assert len(contrasts.shape) == 3 and (contrasts.shape[-1] == pred.shape[-1]), f"Prediction {pred.shape}, Contrast {contrasts.shape}"
 
-    bs, contrast_size, vec_size = batch['negatives'].shape
-    contrast_size = contrast_size + 1  # add positive
+    return torch.cdist(contrasts, pred.unsqueeze(-2), p=2.0).view(bs, contrast_size).to('cpu')
+
+
+def contrastive_train_step(model: AbstractVectorTransform, batch, alpha=1.0):
     pred = model(batch['before'].to(model.device), batch['action'].to(model.device))
-    contrasts = torch.cat((batch['negatives'], batch['positive'].unsqueeze(-2)), dim=-2)
-    distances = torch.cdist(contrasts.to(model.device), pred.unsqueeze(-2)).view(bs, contrast_size).to('cpu')
-    coeff = torch.ones_like(distances) * torch.cat((batch['mask'], torch.ones(bs, 1)), dim=-1)
-    coeff[:, :-1] *= -1  # all negatives except for the last positive
-    triplet_losses = torch.sum(distances * coeff, dim=-1)
-
-    # zero-ing negative values
-    loss = (triplet_losses * (triplet_losses + alpha > 0).to(dtype=triplet_losses.dtype, device=triplet_losses.device)).mean(dim=0)
-
-    return loss
-
-
-def siamese_train_step(model: AbstractVectorTransform, batch, alpha=1.0):
-    bs, contrast_size, vec_size = batch['negatives'].shape
-    contrast_size = contrast_size + 1  # add positive
-    pred = model(batch['before'].to(model.device), batch['action'].to(model.device))
-    contrasts = torch.cat((batch['negatives'], batch['positive'].unsqueeze(-2)), dim=-2)
-    distances = torch.cdist(contrasts.to(model.device), pred.unsqueeze(-2)).view(bs, contrast_size).to('cpu')
-    batch_loss = (alpha + distances[:, -1] - distances[:, :-1]) * batch['mask']
+    contrasts = torch.cat((batch['negatives'], batch['positive'].unsqueeze(-2)), dim=-2).to(model.device)
+    distances = compute_embedding_distance(contrasts, pred)
+    distances = distances ** 2
+    batch_loss = (alpha + (distances[:, -1].unsqueeze(-1) - distances[:, :-1]))
+    # batch_loss = batch_loss * batch['mask']  # annihilates padded elemnents in contrast
     loss = (batch_loss * (batch_loss >= 0).int()).sum(dim=-1).mean(dim=0)
     return loss
 
 
-def iterate(model: AbstractVectorTransform, dl, optimizer=None, loss_fn=None, mode='eval', siamese=False):
+def infonce_train_step(model: AbstractVectorTransform, batch):
+    batch_size, contrast_size, vec_size = batch['negatives'].shape
+    pred = model(batch['before'].to(model.device), batch['action'].to(model.device)).view(batch_size, 1, vec_size).to(batch['negatives'].device)
+
+    # NOTE: we need to transpose prediction to perform MatMul
+    logits_negatives = torch.bmm(batch['negatives'], pred.view(batch_size, vec_size, 1)).view(batch_size, contrast_size)
+    logits_positive = torch.bmm(batch['positive'].view(batch_size, 1, vec_size), pred.view(batch_size, vec_size, 1)).view(batch_size, 1)
+
+    logits = torch.cat((logits_negatives, logits_positive), dim=-1)
+    # logits = logits * torch.cat((batch['mask'], torch.ones(batch_size, 1)), dim=-1)  # annihilates padded elements in contrast
+
+    # 1. Compute random placement of positive for batch
+    displacements = torch.stack([torch.randperm(contrast_size + 1) for _ in range(batch_size)], dim=0)
+    pos_indices = torch.where(displacements == contrast_size)[-1]  # GT for this batch now is the position of the positive <--> last index in the contrast
+
+    batch_indices = torch.tensor([i for i in range(batch_size) for _ in range(contrast_size + 1)])  # help in randomizing contrast position
+
+    reworked_logits = logits[batch_indices, displacements.view(1, -1)].view(logits.shape)
+
+    # 2. Compute crossentropy with correct positive placement
+    loss = F.cross_entropy(reworked_logits, pos_indices)
+
+    return loss
+
+
+def iterate(model: AbstractVectorTransform, dl, optimizer=None, loss_fn=None, mode='eval', contrastive=False, infonce=False):
+    assert not (contrastive and infonce)
     if mode == 'train':
         model.train()
         loss_history = []
         for batch in tqdm(dl, desc=mode.upper() + "..."):
             optimizer.zero_grad()
-            if siamese:
-                loss = siamese_train_step(model, batch)
+            if contrastive:
+                loss = contrastive_train_step(model, batch)
+            elif infonce:
+                loss = infonce_train_step(model, batch)
             else:
                 loss = model.process_batch(batch, loss_fn)
             loss.backward()
@@ -84,8 +104,9 @@ def iterate(model: AbstractVectorTransform, dl, optimizer=None, loss_fn=None, mo
         with torch.no_grad():
             for batch in tqdm(dl, desc=mode.upper() + "..."):
                 preds, gts = model.process_batch(batch)
-                similarity_history.extend(torch.cosine_similarity(preds, gts).tolist())
-        return torch.tensor(similarity_history)
+                # similarity_history.extend(compute_embedding_distance(gts, preds).flatten().tolist())  # list dimension needed for batch evaluation
+                similarity_history.extend(torch.cosine_similarity(preds, gts, dim=-1).flatten().tolist())
+        return torch.tensor(similarity_history).float().mean(dim=-1).item()
     elif mode == 'eval-contrasts':
         assert isinstance(dl, torch.utils.data.Dataset), "in this branch it is assumed for a dataset to be passed"
         model.eval()
@@ -100,24 +121,24 @@ def iterate(model: AbstractVectorTransform, dl, optimizer=None, loss_fn=None, mo
                     action = torch.tensor(smp['action'], dtype=torch.long).unsqueeze(0).to(model.device)
                     pred = model(before_vec, action).to('cpu')
 
-                    contrast = torch.stack(smp['negatives'] + [smp['positive']], dim=0)
+                    contrast = torch.stack(smp['negatives'] + [smp['positive']], dim=0).unsqueeze(0)  # needed unsqueeze to be consistent with model output (batch-size = 1)
 
-                    # distances = torch.cdist(pred, contrast, p=2.0)
+                    distances = compute_embedding_distance(contrast, pred)
                     # distances = ((pred - contrast)**2).sum(dim=-1).squeeze()
                     # distances = torch.norm(pred - contrast, dim=-1)
-                    distances = (1 - torch.cosine_similarity(pred, contrast, dim=-1)) / 2
+                    # distances = (1 - torch.cosine_similarity(pred, contrast, dim=-1)) / 2
 
                     correct = torch.argmin(distances, dim=-1).item() == (distances.shape[-1] - 1)  # correct if the positive (last one) is the nearest
                     accuracy_history.append(int(correct))
                 pbar.update()
             pbar.close()
-            return torch.tensor(accuracy_history).float()
+            return torch.tensor(accuracy_history).float().mean(dim=-1).item()
 
 
 
 
-def train(*args, siamese=False):
-    return iterate(*args, mode='train', siamese=siamese)
+def train(*args, contrastive=False, infonce=False):
+    return round(iterate(*args, mode='train', contrastive=contrastive, infonce=infonce).mean(dim=-1).item(), 4)
 
 
 def evaluate(model, dl, use_contrasts=False):
@@ -125,7 +146,7 @@ def evaluate(model, dl, use_contrasts=False):
     acc = None
     if use_contrasts:
         acc = iterate(model, dl.dataset, mode='eval-contrasts')
-    return sim, acc
+    return round(sim, 4), round(acc, 4)
 
 
 def baselines_evaluation(test_set):
@@ -137,22 +158,27 @@ def baselines_evaluation(test_set):
         smp = test_set[i]  # dict containing 'before', 'action', 'positive', 'negatives', 'neg_actions'
         if len(smp['negatives']) > 0:  # remove contrast with only 1 positive
             before_vec = smp['before'].unsqueeze(0)
-            # action = torch.tensor(smp['action'], dtype=torch.long).unsqueeze(0)
+            # action = torch.tensor(smp['action'], dtype=torch.long).unsqueeze(0)  # not needed
             pred = before_vec
 
-            contrast = torch.stack(smp['negatives'] + [smp['positive']], dim=0)
-
-            distances = (1 - torch.cosine_similarity(pred, contrast, dim=-1)) / 2
+            contrast = torch.stack(smp['negatives'] + [smp['positive']], dim=0).unsqueeze(0)  # add fake batch dimension
+            distances = compute_embedding_distance(contrast, pred)
+            # distances = torch.cosine_similarity(contrast, pred, dim=-1)
 
             sim_correct = torch.argmin(distances, dim=-1).item() == (distances.shape[-1] - 1)  # correct if the positive (last one) is the nearest
             similarity_acc.append(int(sim_correct))
 
-            rand_correct = torch.randint(distances.shape[-1], (1,)).item() == (distances.shape[-1] - 1)
-            random_acc.append(int(rand_correct))
+            random_acc.append(len(smp['negatives']))
+
         pbar.update()
     pbar.close()
 
-    return {'random': torch.tensor(random_acc).float(), 'similarity': torch.tensor(similarity_acc).float()}
+    random_acc = 1 / (sum(random_acc) / len(random_acc))
+
+    return {
+        'random': round(random_acc, 4),
+        'similarity': round(torch.tensor(similarity_acc).float().mean(dim=-1).item(), 4)
+    }
 
 
 _ALLOWED_MODELS = ['moca-rn', 'clip-rn']
@@ -177,21 +203,22 @@ __default_train_config__ = {
     'dropout_p': (0.0, [0.0, 0.3, 0.5, 0.7, 0.9]),
     'activation': ('none', allowed_activations),
     'hidden_sizes': (None, ),
-    'use_siamese': False,
+    'use_contrastive': False,
+    'use_infonce': False,
 
     # Dataset settings
     'extractor_model': ('moca-rn', _ALLOWED_MODELS),
     'use_regression': False,
-    'hold_out_procedure': ('none', VecTransformDataset.allowed_holdout_procedures),
+    'hold_out_procedure': ('samples', VecTransformDataset.allowed_holdout_procedures),
     'hold_out_size': (4, ),
 
     # Statistics
     'statistical_iterations': (5, ),
 
     # Others
-    'data_path': ('dataset/data-bbxs',),
+    'data_path': ('new-dataset/data-improved-descriptions',),
     'save_model': False,
-    'save_path': ('VECT_results', ),
+    'save_path': ('new-vect-results', ),
 
     'device': ('cuda' if torch.cuda.is_available() else 'cpu', ['cuda', 'cpu']),
     'dataparallel': False,
@@ -210,8 +237,18 @@ __tosave_hyperparams__ = [
     'activation',
     'extractor_model',
     'use_regression',
-    'use_siamese'
+    'use_contrastive',
+    'use_infonce'
 ]
+
+
+def get_savepath(st_path, args, create_dir=True):
+    os.makedirs(str(st_path), exist_ok=True)
+    save_name = f"{max([int(name.split('_')[0] if name.split('_')[0].isdigit() else -1) for name in os.listdir(st_path)], default=-1) + 1}_@{args.statistical_iterations}"
+    save_path = st_path / save_name
+    if create_dir:
+        os.makedirs(save_path, exist_ok=True)
+    return save_path
 
 
 def get_model(actions, vec_size, args, **kwargs):
@@ -227,11 +264,6 @@ def run_training(args, fixed_dataset=None, save_results=True, plot=True):
     else:
         full_dataset, train_dl, valid_dl, test_dl = fixed_dataset
 
-    # print(len(full_dataset._action_dataset.annotation))
-    # print(len(full_dataset.train_rows))
-    # print(len(full_dataset.hold_out_rows))
-    # print(len(full_dataset.non_empty_contrasts[full_dataset.non_empty_contrasts]))
-
     model = get_model(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), args)
     opt, sched = get_optimizer(args, model)
     loss_fn = torch.nn.MSELoss()
@@ -240,24 +272,27 @@ def run_training(args, fixed_dataset=None, save_results=True, plot=True):
     ep_acc_mean = []
 
     # Prepares path for saving
-    args.vect_model = args.vect_model + ('-siamese' if args.use_siamese else '')
+    if args.use_contrastive:
+        args.vect_model = args.vect_model + '-contrastive'
+    elif args.use_infonce:
+        args.vect_model = args.vect_model + '-infonce'
+
     pth = Path(args.save_path, "models", "+".join([args.vect_model, args.extractor_model]))
-    new_idx = str(max([int(el) for el in os.listdir(pth) if el.isdigit()], default=-1) + 1) if os.path.exists(pth) else '0'
-    pth = pth / new_idx
+    pth = get_savepath(pth, args, create_dir=save_results)
 
     best_acc = -1.0
     for ep in range(nr_epochs):
         print("EPOCH", ep + 1, "/", nr_epochs)
 
         # Training
-        ep_loss_mean.append(round(train(model, train_dl, opt, loss_fn, siamese=args.use_siamese).mean(dim=0).item(), 4))
+        ep_loss_mean.append(train(model, train_dl, opt, loss_fn, contrastive=args.use_contrastive, infonce=args.use_infonce))
         print("Train loss: ", ep_loss_mean[-1])
 
         # Validation
-        ev_result = evaluate(model, valid_dl, use_contrasts=True)
-        ep_sim_mean.append(round(ev_result[0].mean(dim=0).item(), 4))
+        ev_sim, ev_acc = evaluate(model, valid_dl, use_contrasts=True)
+        ep_sim_mean.append(ev_sim)
         print("Eval sim: ", ep_sim_mean[-1])
-        ep_acc_mean.append(round(ev_result[1].mean(dim=0).item(), 4))
+        ep_acc_mean.append(ev_acc)
         print("Eval acc: ", ep_acc_mean[-1])
 
         if args.save_model:
@@ -268,8 +303,7 @@ def run_training(args, fixed_dataset=None, save_results=True, plot=True):
     # TESTING
     print()
     print("------ TEST ------")
-    test_res = evaluate(model, test_dl, use_contrasts=True)
-    test_sim, test_acc = round(test_res[0].mean(dim=-1).item(), 4), round(test_res[1].mean(dim=-1).item(), 4)
+    test_sim, test_acc = evaluate(model, test_dl, use_contrasts=True)
     print("Test sim: ", test_sim)
     print("Test acc: ", test_acc)
 
@@ -278,7 +312,7 @@ def run_training(args, fixed_dataset=None, save_results=True, plot=True):
         os.makedirs(pth, exist_ok=True)
 
         with open(pth / 'config.json', mode='wt') as f:
-            json.dump(vars(args), f)
+            json.dump(vars(args), f, indent=2)
 
         # Saving metrics
         pandas.DataFrame({
@@ -318,10 +352,7 @@ def exp_hold_out(args):
     args.use_bn = True
 
     st_path = Path(args.save_path, "statistics", "hold-out")
-    os.makedirs(str(st_path), exist_ok=True)
-    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path)], default=-1) + 1}_@{args.statistical_iterations}"
-    save_path = st_path / save_name
-    os.makedirs(save_path, exist_ok=True)
+    save_path = get_savepath(st_path, args)
 
     # Here for debug
     # df = {
@@ -332,7 +363,7 @@ def exp_hold_out(args):
     #     'accuracy': [0, 1, 2, 3]
     # }
 
-    tested_procedures = ['object_name', 'scene']
+    tested_procedures = ['samples', 'object_name', 'scene']
     nr_samples_per_it = {k: [] for k in tested_procedures}
 
     tested_vect_models = ['linear', 'linear-concat', 'fcn']
@@ -371,7 +402,7 @@ def exp_hold_out(args):
                         'extractor_model': extractor_model,
                         'vect_model': 'baseline-' + k,
                         'similarity': -1.0,
-                        'accuracy': round(bsl_acc[k].mean(dim=0).item(), 4)
+                        'accuracy': bsl_acc[k]
                     })
 
     with open(save_path / 'items.txt', mode='at') as f:
@@ -381,13 +412,17 @@ def exp_hold_out(args):
         }))
 
     with open(save_path / 'config.json', mode='at') as f:
-        json.dump(vars(args), f)
+        json.dump(vars(args), f, indent=2)
 
     df = pandas.DataFrame(df, columns=['extractor_model', 'vect_model', 'hold_out_procedure', 'similarity', 'accuracy'])
     df.to_csv(save_path / 'results.csv', index=False)
 
-    seaborn.set(font_scale=2)
-    g = seaborn.catplot(x='extractor_model', y='accuracy', hue='vect_model', data=df, col="hold_out_procedure", kind="bar", height=10, aspect=.75)
+    seaborn.set(font_scale=1)
+
+    # create column plot
+    g = seaborn.catplot(x='extractor_model', y='accuracy', hue='vect_model', data=df[~df['vect_model'].isin({'baseline-random', 'baseline-similarity'})], col="hold_out_procedure", kind="bar", height=10, aspect=.75)
+    [ax.axhline(df[df['vect_model'] == 'baseline-random']['accuracy'].mean(), linestyle='--') for el in g for ax in el.axes]  # random baseline
+    [ax.axhline(df[df['vect_model'] == 'baseline-similarity']['accuracy'].mean(), linestyle='--') for el in g for ax in el.axes]  # random baseline
     g.savefig(save_path / 'stats.png')
 
     g = seaborn.catplot(hue='extractor_model', x='vect_model', y='accuracy', data=df, kind='swarm', col='hold_out_procedure')
@@ -419,15 +454,13 @@ def exp_fcn_hyperparams(args):
             args = vars(args)
             args.update(cfg)
             args = Namespace(**args)
-            args.vect_model = 'fcn'  # needed for consistency with siamese setup
+            args.vect_model = 'fcn'  # needed for consistency with contrastive setup
             sim, acc, ds = run_training(args, save_results=False, plot=False)
             df.append({**cfg, **{'similarity': sim, 'accuracy': acc}})
     df = pandas.DataFrame(df, columns=list(hyperparam_options.keys()) + ['similarity', 'accuracy'])
 
     st_path = Path(args.save_path, "statistics", "hyperparams")
-    os.makedirs(st_path, exist_ok=True)
-    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path)], default=-1) + 1}_@{args.statistical_iterations}"
-    os.makedirs(str(st_path / save_name), exist_ok=True)
+    save_name = get_savepath(st_path, args)
     df.to_csv(st_path / save_name / "result.csv", index=False)
     with open(st_path / save_name / 'best.txt', mode='wt') as f:
         bst = df.iloc[df['accuracy'].idxmax()].to_dict()
@@ -438,11 +471,8 @@ def exp_fcn_hyperparams(args):
 def run_train_regression(args, fixed_dataset=None, save_results=False):
 
     # Prepares path for saving
-    pth = Path(args.save_path, "models", "+".join([args.vect_model, args.extractor_model]))
-    os.makedirs(pth, exist_ok=True)
-    new_idx = str(max([int(el) for el in os.listdir(pth) if el.isdigit()], default=-1) + 1) if os.path.exists(pth) else '0'
-    pth = pth / new_idx
-    os.makedirs(exist_ok=True)
+    pth = Path(args.save_path, "regression", "+".join([args.vect_model, args.extractor_model]))
+    pth = get_savepath(pth, args)
 
     if fixed_dataset is not None:
         full_dataset, reg_matrices, test_dl = fixed_dataset
@@ -463,7 +493,7 @@ def run_train_regression(args, fixed_dataset=None, save_results=False):
         os.makedirs(pth, exist_ok=True)
 
         with open(pth / 'config.json', mode='wt') as f:
-            json.dump(vars(args), f)
+            json.dump(vars(args), f, indent=2)
 
         pandas.DataFrame({
             'similarity': test_sim,
@@ -482,11 +512,8 @@ def exp_regression(args):
     args.use_regression = True
 
     st_path = Path(args.save_path, "regression")
-    os.makedirs(str(st_path), exist_ok=True)
 
-    save_name = f"{max([int(name.split('_')[0]) for name in os.listdir(st_path) if f'stats@{args.statistical_iterations}' in name], default=-1) + 1}_stats@{args.statistical_iterations}"
-    save_path = st_path / save_name
-    os.makedirs(save_path, exist_ok=True)
+    save_path = get_savepath(st_path, args)
 
     nr_samples_per_it = {k: [] for k in tested_procedures}
     df = []

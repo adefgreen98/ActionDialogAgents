@@ -27,6 +27,8 @@ from visual_features.vision_helper.utils import collate_fn as default_collate_fn
 NEGATIVE_SAMPLING_METHODS = [
     'fixed_onlyhard',
     'random_onlysoft',
+    'default3',
+    'default4'
     # 'fixed_soft+hard', 'random_soft+hard'
 ]
 
@@ -40,6 +42,7 @@ ACTION_CONVERSION_TABLE = {
     __other_scene_action_id__: 'other'  # needed for soft negatives
 }
 
+# TODO update this set
 # here not to be used dynamically but only as a reference
 __bbox_target_categories__ = {'CellPhone', 'Pen', 'Towel', 'Candle', 'SoapBar', 'Footstool', 'BaseballBat', 'WateringCan',
                          'SoapBottle', 'Egg', 'DishSponge', 'Book', 'HandTowel', 'Ladle', 'Pencil', 'Plunger', 'Kettle',
@@ -71,15 +74,18 @@ def convert_action(name: str):
 
 def rework_annotations_path(df, basepath):
     # TODO: automatic handling of different path specifications
-    df['after_image_path'] = df['after_image_path'].map(lambda pth: str(Path(*basepath.parts[:-1], pth)))
-    df['before_image_path'] = df['before_image_path'].map(lambda pth: str(Path(*basepath.parts[:-1], pth)))
+    # df['after_image_path'] = df['after_image_path'].map(lambda pth: str(Path(*basepath.parts[:-1], pth)))
+    # df['before_image_path'] = df['before_image_path'].map(lambda pth: str(Path(*basepath.parts[:-1], pth)))
+    for col in df.columns:
+        if "path" in col:
+            df[col] = df[col].map(lambda pth: str(Path(*basepath.parts[:-1], pth)))
     return df
 
 
 class ActionDataset(Dataset):
     def __init__(self,
                  path='dataset/data-bbxs',
-                 negative_sampling_method='fixed_onlyhard',
+                 negative_sampling_method='default3',
                  soft_negatives_nr=2,
                  image_extension='png',
                  transform=None,
@@ -91,7 +97,7 @@ class ActionDataset(Dataset):
 
         # TODO: drop the (train-)split column and select which (train-)split to use
         # annotations dataframe
-        self.annotation = pandas.read_csv(self.path / 'bbox-data.csv', index_col=0)
+        self.annotation = pandas.read_csv(self.path / 'dataset_cs_scene_object_nopt_augmented_recep.csv', index_col=0)
         self.annotation = rework_annotations_path(self.annotation, self.path)  # rework paths for mismatch at top directory
         self.annotation.index = pandas.Series(range(len(self.annotation)))  # rework index for consistency
 
@@ -111,10 +117,6 @@ class ActionDataset(Dataset):
             [int(self.annotation.loc[i, 'image_name'].split("_")[0]) for i in range(len(self.annotation))]
         )))
 
-        # populates contrasts
-        # self.samples = self._load_samples()
-        self._load_negatives()
-
         # defines default transformation of torchvision models (if not provided) + normalize with its stats
         if transform is None:
             self.transform = transforms.Compose([
@@ -127,65 +129,24 @@ class ActionDataset(Dataset):
     def __len__(self):
         return len(self.annotation)
 
-    def _read_image_from_annotation_path(self, path: str):
+
+    @staticmethod
+    def _read_image_from_annotation_path(path: str):
         return Image.open(Path(path))
 
     def __getitem__(self, i) -> dict:
-        # smp = self.samples[i]
-        # res = {
-        #     'positive': self.transform(Image.open(str(self.path / smp['scene'] / smp['positive']))),
-        #     'before': self.transform(Image.open(str(self.path / smp['scene'] / smp['before']))),
-        #     'action': smp['action'],
-        #     'neg_actions': smp['neg_actions'],
-        #     'negatives': [self.transform(Image.open(str(self.path / neg))) for neg in smp['negatives']]  # since negatives may be from a different scene their path should already contain it
-        # }
         smp = self.annotation.iloc[i]
-        # try:
-        #
-        # except TypeError:
-        #     print(*[self.annotation.loc[neg_i, 'action_name'] for neg_i in smp['contrast']], sep='\n')
-        #     exit(1)
+        contrast_paths = [smp[col + "_path"] for col in ['distractor0', 'distractor1', 'distractor2']]
+        contrast_actions = [smp[col + "_action_name"] for col in ['distractor0', 'distractor1', 'distractor2']]
         res = {
             'positive': self.transform(self._read_image_from_annotation_path(smp['after_image_path'])),
             'before': self.transform(self._read_image_from_annotation_path(smp['before_image_path'])),
             'action': self.actions_map[smp['action_name']],
-            'neg_actions': [self.actions_map[ac] for ac in self.annotation.loc[smp['contrast'], 'action_name']],
-            'negatives': [self.transform(self._read_image_from_annotation_path(pth)) for pth in self.annotation.loc[smp['contrast'], 'after_image_path']],
+            'neg_actions': [self.actions_map[ac] for ac in contrast_actions],
+            'negatives': [self.transform(self._read_image_from_annotation_path(pth)) for pth in contrast_paths],
         }
         return res
 
-    def _load_negatives(self):
-        """Computes contrast sets by adding a new column ('contrast') to the annotation DataFrame.
-
-        Possible methods (determined by the 'negative_sampling_method' field of this class) are:
-        * fixed, same environment
-        * fixed, different environments plus same environment (hard distractors) (TODO)
-        * randomized different environments plus fixed of same environment (TODO)
-        * randomized from different scenes, while the positive is the only one from the actual scene
-        """
-        self.annotation['contrast'] = None
-        if self.negative_sampling_method == 'fixed_onlyhard':
-            contrasts = [
-                self.annotation[lambda df: df['before_image_path'] == before_img].index.to_list()
-                for before_img in set(self.annotation['before_image_path'].to_list())
-            ]
-            for c in contrasts:
-                for img_idx in c:
-                    self.annotation.at[img_idx, 'contrast'] = pandas.Index(set(c) - {img_idx})
-        elif self.negative_sampling_method == 'random_onlysoft':
-            for i in range(len(self.annotation)):
-                c = []
-                msk = (self.annotation['contrast_set'] == self.annotation.loc[i, 'contrast_set']) & \
-                      (self.annotation['scene'] != self.annotation.loc[i, 'scene'])
-                c = self.annotation[msk].sample(self.soft_negatives_nr).index
-                # while len(c) < self.soft_negatives_nr:
-                #     neg_i = random.sample(indices, k=1)
-                #     neg_smp = self.annotation.iloc[neg_i]
-                #     if neg_i != i and \
-                #             neg_smp['contrast_set'].item() == self.annotation.loc[i, 'contrast_set'] and \
-                #             neg_smp['scene'].item() != self.annotation.loc[i, 'scene']:
-                #         c.append(neg_i)
-                self.annotation.at[i, 'contrast'] = c
 
     @staticmethod
     def _scene_from_path(p) -> str:
@@ -213,49 +174,14 @@ class ActionDataset(Dataset):
 
 
 class VecTransformDataset(Dataset):
-
-    allowed_holdout_procedures = ['none', 'object_name', 'scene', 'object_type', 'sample']
-
-    # NOTE: for regression matrix, each visual vector in float32 takes
-    #                   0.000374510884 GB   ((1 * 100352 * 4) / 2^10)
-    # of memory. Supposing 4800 samples (which are very few) we end up in occupying ~1.8 GB.
+    allowed_holdout_procedures = ['samples', 'object_name', 'scene']
 
     def __init__(self,
                  extractor_model='moca-rn',
+                 hold_out_procedure='objects',
                  override_transform=None,
-                 hold_out_size=1,
-                 hold_out_procedure='none',
-                 hold_out_indices=None,
-                 randomize_hold_out=True,
                  **kwargs):
-        """
-        Initializes the dataset for vector transformation. Eventually, this also extracts visual vectors, if these
-        are not present at the specified path (as additional keyword argument).
-
-        There are 5 possible hold out modalities (with their string code in brackets):
-
-        * None [none]
-        * Object [object_name]: instances of the specified nr. of objects will be selected and excluded from each scene's training data, meaning that before and after vectors from all of their scenes will be placed in the hold-out dataset
-        * Scene [scene]: all vectors from a scene will be placed in the hold-out set
-        * Object type [object_type]: all instances of a specific object type (e.g. 'Mug' of different colors) will be held out from all the scenes
-        * Sample [sample]: specific instances of an object will be held-out by picking them from a specific scene (useful when there are more than 1 object instance per scene)
-
-        ------------------------------------------------------------------------
-
-        :param extractor_model: name for convolutional model that will be used for exracting features
-        :param override_transform: torchvision.transform that will replace the one provided by the model (default: None); it can also be a string "to_tensor", automatically initializing it as a ToTensor transform.
-        :param hold_out_size: size of the held-out set, in terms of items selected to be excluded (respectively: object instances, scenes, object types, object instances of a specific scene)
-        :param hold_out_procedure: type of hold out method used (default: None)
-        :param hold_out_indices: allows specifying indices of items of the hold-out group that will be selected
-        :param randomize_hold_out: whether to randomize creation of the held-out set at the first time, used in combination with hold_out_indices
-        :param use_contrast_set: decide to keep and use contrast sets of the internal ActionDataset (negative sampling can be controlled with additional keyword arguments)
-        :param kwargs: keyword arguments for the internal ActionDataset structure
-        """
-
-        hold_out_size = int(hold_out_size)
-
         self._action_dataset = ActionDataset(**kwargs, transform=transforms.ToTensor())
-        self.non_empty_contrasts = self._action_dataset.annotation['before_image_path'].map(lambda el: len(self._action_dataset.annotation[self._action_dataset.annotation['before_image_path'] == el]) != 1)
 
         self.extractor_model = extractor_model
 
@@ -263,6 +189,7 @@ class VecTransformDataset(Dataset):
 
         self.actions_to_ids = self._action_dataset.actions_map
         self.ids_to_actions = {v: k for k, v in self.actions_to_ids.items()}
+        self.hold_out_procedure = hold_out_procedure
 
         if isinstance(override_transform, str):
             if override_transform == 'to_tensor':
@@ -272,76 +199,44 @@ class VecTransformDataset(Dataset):
 
         if not os.path.exists(self.path):
             os.makedirs(self.path, exist_ok=True)
-            self.before_vectors, self.after_vectors = self.preprocess()
-            with open(self.path / 'before.pkl', mode='wb') as bpth:
-                pickle.dump(self.before_vectors, bpth)
-            with open(self.path / 'after.pkl', mode='wb') as apth:
-                pickle.dump(self.after_vectors, apth)
+            self.vectors = self.preprocess()
+            with open(self.path / 'vectors.pkl', mode='wb') as vpth:
+                pickle.dump(self.vectors, vpth)
         else:
-            """
-            samples = {
-                'before_vectors' --> {before_path --> v}},
-                'after_vectors' ---> DataFrame['scene', 'object', 'action', 'vector'] (+ other columns from ActionDataset)
-            }
-            """
-            with open(self.path / 'before.pkl', mode='rb') as bpth:
-                self.before_vectors = pickle.load(bpth)
+            with open(self.path / 'vectors.pkl', mode='rb') as vpth:
+                self.vectors = pickle.load(vpth)
 
-            with open(self.path / 'after.pkl', mode='rb') as apth:
-                self.after_vectors = pickle.load(apth)
 
-        assert hold_out_procedure in self.allowed_holdout_procedures
-        self.hold_out_procedure = hold_out_procedure
-
-        if self.hold_out_procedure != 'none':
-            # only supports randomization when no predefined indices are selected
-            assert (randomize_hold_out and (hold_out_indices is None)) or \
-                   ((not randomize_hold_out) and (hold_out_indices is not None))
-            self.hold_out_indices = hold_out_indices
-
-            assert hold_out_size > 0
-            self.hold_out_size = hold_out_size
-
-            # prepares the set where to choose hold-out items (according to hold-out methods)
-            self.hold_out_item_group = {
-                'object_name': list(set(self._action_dataset.objects.keys())),
-                'scene': list(set(self._action_dataset.annotation['scene'].to_list())),
-                'object_type': None,
-                'sample': self.after_vectors.index.to_list()
-            }[self.hold_out_procedure]
-
-            if self.hold_out_indices is None:
-                self.hold_out_indices = list(range(len(self.hold_out_item_group)))
-                if randomize_hold_out:
-                    random.shuffle(self.hold_out_indices)
-                self.hold_out_indices = self.hold_out_indices[-self.hold_out_size:]
-
-            # creates list of dataset row indices to exclude according to selected hold-out items
-            # msk = self._action_dataset.annotation[self.hold_out_procedure].map(lambda el: el in {self.hold_out_item_group[idx] for idx in self.hold_out_indices})
-            msk = self._action_dataset.annotation[self.hold_out_procedure].isin({self.hold_out_item_group[idx] for idx in self.hold_out_indices})
-            self.train_rows = self.after_vectors[(~msk) & self.non_empty_contrasts].index
-            self.hold_out_rows = self.after_vectors[msk & self.non_empty_contrasts].index
-        else:
-            self.hold_out_size = 0
-            self.hold_out_rows = pandas.Series([])
-            self.train_rows = self.after_vectors[self.non_empty_contrasts].index
+        self._internal_split_name_map = {
+            'object_name': 'object_split',
+            'scene': 'scene_split',
+            'samples': 'sample_split'
+        }
+        self.hold_out_rows = self._action_dataset.annotation[self._internal_split_name_map[self.hold_out_procedure]][lambda el: el == 'test'].index
+        self.seen_rows = self._action_dataset.annotation[self._internal_split_name_map[self.hold_out_procedure]][lambda el: el != 'test'].index
 
 
     def __len__(self):
-        return len(self.after_vectors)
+        return len(self._action_dataset)
 
     def __getitem__(self, item):
-        after_smp = self.after_vectors.iloc[item]
+        after_smp = self._action_dataset.annotation.iloc[item]
+        contrast_paths = [after_smp[col + "_path"] for col in ['distractor0', 'distractor1', 'distractor2']]
+        contrast_actions = [after_smp[col + "_action_name"] for col in ['distractor0', 'distractor1', 'distractor2']]
         res = {
-            'before': self.before_vectors[after_smp['before_image_path']],
+            'before': self.vectors[after_smp['before_image_path']],
             'action': self.actions_to_ids[after_smp['action_name']],  # TODO fix issue in ActionDataset to solve also here
-            'positive': after_smp['vector'],
-            'negatives': [self.after_vectors.loc[neg_i, 'vector'] for neg_i in after_smp['contrast']],
-            'neg_actions': [self.actions_to_ids[self.after_vectors.loc[neg_i, 'action_name']] for neg_i in after_smp['contrast']]
+            'positive': self.vectors[after_smp['after_image_path']],
+            'negatives': [self.vectors[pth] for pth in contrast_paths],
+            # 'neg_actions': [self.actions_to_ids[ac] for ac in contrast_actions]
         }
         return res
 
     def preprocess(self):
+        """
+        Preprocesses the whole dataset by creating & saving vectors of visual features corresponding to the chosen
+        feature extraction architecture.
+        """
         from argparse import Namespace
         from visual_features.visual_baseline import load_model_and_transform
 
@@ -359,56 +254,50 @@ class VecTransformDataset(Dataset):
                     t.mean = self._action_dataset.get_stats()['mean']
                     t.std = self._action_dataset.get_stats()['std']
 
-        # excludes 'contrast' column from the action categorization task and adds the 'vector' column
-        # self.after_vectors = self._action_dataset.annotation[[c for c in self._action_dataset.annotation.columns if c not in {'contrast'}]].copy()
+        self.vectors = None
 
-        self.after_vectors = self._action_dataset.annotation.copy()  # also include 'contrast' column (containing contrast set for each sample)
-        self.before_vectors = None
+        paths = {el for s in [self._action_dataset.annotation[col] for col in self._action_dataset.annotation.columns if "path" in col] for el in s}
 
         def get_vec(pth):
             return extractor(transform(Image.open(pth)).unsqueeze(0).to(extractor.device)).squeeze().cpu()
 
         with torch.no_grad():
-            self.after_vectors['vector'] = pandas.Series([
-                get_vec(pth)
-                for pth in tqdm(self.after_vectors['after_image_path'], desc=f"Extracting 'after' visual vectors using {self.extractor_model}...")
-            ])
-            self.before_vectors = {
-                bf_path: get_vec(bf_path) for bf_path in tqdm(set(self.after_vectors['before_image_path'].to_list()), desc=f"Extracting 'before' visual vectors using {self.extractor_model}...")
+            self.vectors = {
+                pth: get_vec(pth) for pth in tqdm(paths, desc=f"Extracting visual vectors with {self.extractor_model}...")
             }
 
-        return self.before_vectors, self.after_vectors
+        return self.vectors
+
 
     def split(self, valid_ratio=-1.0, for_regression=False):
         """Splits dataset with the current hold-out settings (defined in initialization). An additional parameter
         allows controlling whether data should be prepared for regression or not.
         Returns two torch Subset objects that contain samples with the training and the held-out sets."""
 
-        if self.hold_out_procedure == 'none':
-            print("Warning: no holding out procedure specified, so test set and validation set will coincide")
-
         hold_out = Subset(self, self.hold_out_rows.to_list())
         if for_regression:
-            train_after_df = self.after_vectors.iloc[self.train_rows]
+            train_after_df = self._action_dataset.annotation.iloc[self.seen_rows]
             train_after = {action: [] for action in set(self.actions_to_ids.values())}
             train_before = {action: [] for action in set(self.actions_to_ids.values())}
             for i, after_row in train_after_df.iterrows():
-                train_after[self.actions_to_ids[after_row['action_name']]].append(after_row['vector'])
-                train_before[self.actions_to_ids[after_row['action_name']]].append(self.before_vectors[after_row['before_image_path']])
+                train_after[self.actions_to_ids[after_row['action_name']]].append(self.vectors[after_row['after_image_path']])
+                train_before[self.actions_to_ids[after_row['action_name']]].append(self.vectors[after_row['before_image_path']])
 
+            vec_dtype = list(self.vectors.values())[0].dtype
+            vec_device = list(self.vectors.values())[0].device
             for action in train_after:
                 if len(train_after[action]) > 0:
                     train_after[action] = torch.stack(train_after[action], dim=0)
                     train_before[action] = torch.stack(train_before[action], dim=0)
                 else:
-                    print(f"Not found samples for action {self.ids_to_actions[action]}, hold out set is {set(self.after_vectors.loc[self.hold_out_indices, self.hold_out_procedure])}")
-                    train_after[action] = torch.tensor([[]], dtype=self.after_vectors.loc[0, 'vector'].dtype, device=self.after_vectors.loc[0, 'vector'].device)
-                    train_before[action] = torch.tensor([[]], dtype=self.after_vectors.loc[0, 'vector'].dtype, device=self.after_vectors.loc[0, 'vector'].device)
+                    print(f"Not found samples for action {self.ids_to_actions[action]}, hold out set is {self.get_hold_out_items()}")
+                    train_after[action] = torch.tensor([[]], dtype=vec_dtype, device=vec_device)
+                    train_before[action] = torch.tensor([[]], dtype=vec_dtype, device=vec_device)
 
             return (train_before, train_after), hold_out
         else:
             assert (0 < valid_ratio < 1) or valid_ratio == -1.0, "choose for validation ratio a value in (0, 1)"
-            train = Subset(self, self.train_rows.to_list())
+            train = Subset(self, self.seen_rows.to_list())
             valid_indices = []
             if valid_ratio > 0:
                 sep = int(len(train) * (1 - valid_ratio))
@@ -418,23 +307,24 @@ class VecTransformDataset(Dataset):
                 train_set = Subset(train, train_indices)
                 valid_set = Subset(train, valid_indices)
 
-                if self.hold_out_procedure == 'none':
-                    hold_out = valid_set
-
                 return train_set, valid_set, hold_out
             else:
                 valid = Subset(train, [])
                 return train, valid, hold_out
 
     def get_vec_size(self):
-        return self.after_vectors.loc[0, 'vector'].shape[-1]
+        return list(self.vectors.values())[0].shape[-1]
 
     def get_hold_out_items(self):
-        return set(self.after_vectors.loc[self.hold_out_rows, self.hold_out_procedure].to_list())
+        ho_items = {
+            'object_name': set(self._action_dataset.annotation.loc[self.hold_out_rows, 'object_name'].to_list()),
+            'scene': set(self._action_dataset.annotation.loc[self.hold_out_rows, 'scene'].to_list()),
+            'samples': set(self.hold_out_rows.to_list())
+        }
+        return ho_items[self.hold_out_procedure]
 
     def get_nr_hold_out_samples(self):
         return len(self.hold_out_rows)
-
 
 
 class BBoxDataset(torch.utils.data.Dataset):
@@ -559,7 +449,7 @@ def vect_collate(batch):
     return before, actions, after
 
 
-def siamese_collate(batch):
+def contrastive_collate(batch):
     """
     :param batch: list of dicts containing 'before' --> tensor, 'action' --> id, 'positive' --> after tensor, 'negatives' --> list of tensors, 'neg_actions' --> list of action ids for negatives
     :return: a tuple (stacked befores, stacked positives, stacked postive actions, batch of stacked negatives, batch of stacked neg-actions)
@@ -569,15 +459,11 @@ def siamese_collate(batch):
         'before': torch.stack([batch[i]['before'] for i in range(len(batch))], dim=0),
         'action': torch.tensor([batch[i]['action'] for i in range(len(batch))], dtype=torch.long),
         'positive': torch.stack([batch[i]['positive'] for i in range(len(batch))], dim=0),
-        'neg_actions': pad_sequence([torch.tensor(batch[i]['neg_actions'], dtype=torch.long) for i in range(len(batch))], batch_first=True, padding_value=-1),
-        'negatives': pad_sequence([torch.stack(batch[i]['negatives'], dim=0) for i in range(len(batch))], batch_first=True, padding_value=0)
+        'negatives': torch.stack([torch.stack(batch[i]['negatives'], dim=0) for i in range(len(batch))], dim=0)
+        # 'neg_actions': pad_sequence([torch.tensor(batch[i]['neg_actions'], dtype=torch.long) for i in range(len(batch))], batch_first=True, padding_value=-1),
+        # 'negatives': pad_sequence([torch.stack(batch[i]['negatives'], dim=0) for i in range(len(batch))], batch_first=True, padding_value=0)
     }
-    # negs = []
-    # for i in range(len(batch)):
-    #     negs.append(torch.stack(batch[i]['negatives'], dim=0))
-    #     print(negs[-1].shape)
-    # res['negatives'] = pad_sequence(negs, batch_first=True, padding_value=0)
-    res['mask'] = (res['neg_actions'] >= 0).float()
+    # res['mask'] = (res['neg_actions'] >= 0).float()
     return res
 
 
@@ -605,7 +491,9 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
 
         train_set, valid_set, test_set = dataset.split(valid_ratio=valid_ratio, for_regression=False)
 
-        train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=siamese_collate if kwargs.get('use_siamese', False) else vect_collate)
+        train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size,
+                                               collate_fn=contrastive_collate if (kwargs.get('use_contrastive', False) or kwargs.get('use_infonce', False)) else vect_collate
+                                               )
         valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=vect_collate)
         test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=vect_collate)  # here for compatibility, but dataset will be accessed with test_dl.dataset
     else:
