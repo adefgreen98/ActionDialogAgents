@@ -1,3 +1,4 @@
+import json
 from collections import OrderedDict
 
 import torch
@@ -16,7 +17,6 @@ __allowed_activations__ = {
 
 __shared_embedding_size__ = 256
 __action_embedding_size__ = 768
-
 
 
 class AbstractVectorTransform(ABC, nn.Module):
@@ -112,7 +112,7 @@ class LinearVectorTransform(AbstractVectorTransform):
         self.weights = nn.Parameter(torch.stack([nn.Linear(self.vec_size, self.vec_size, bias=False).weight.clone().detach() for i in range(self.nr_actions)], dim=0))
 
 
-    def forward(self, before, action, after, negatives):
+    def forward(self, before, action, after=None, negatives=None):
         # Normalize vector?
         pred = before.unsqueeze(1).bmm(self.weights.index_select(0, action))
         return before, pred.squeeze(1), after, negatives
@@ -159,11 +159,13 @@ class LinearConcatVecT(AbstractVectorTransform):
 
         self.net = nn.Linear(layer_sizes[0], layer_sizes[-1])
 
-    def forward(self, before, action, after, negatives):
+    def forward(self, before, action, after=None, negatives=None):
         before = self.embed_visual(before)
         pred = self.net(torch.cat([before, self.embed_action(action)], dim=-1))
-        after = self.embed_visual(after)
-        negatives = self.embed_visual(negatives)
+        if after is not None:
+            after = self.embed_visual(after)
+        if negatives is not None:
+            negatives = self.embed_visual(negatives)
         return before, pred, after, negatives
 
 
@@ -203,10 +205,50 @@ class ConditionalFCNVecT(AbstractVectorTransform):
                 for i in range(len(layer_sizes) - 1)]  # because building with (i, i+1)
             )
 
-    def forward(self, before, action, after, negatives):
+    def forward(self, before, action, after=None, negatives=None):
         before = self.embed_visual(before)
         pred = self.net(torch.cat([before, self.embed_action(action)], dim=-1))
-        after = self.embed_visual(after)
-        negatives = self.embed_visual(negatives)
+        if after is not None:
+            after = self.embed_visual(after)
+        if negatives is not None:
+            negatives = self.embed_visual(negatives)
         return before, pred, after, negatives
 
+
+__name_map__ = {
+    'Action-Matrix': LinearVectorTransform,
+    'Concat-Linear': LinearConcatVecT,
+    'Concat-Multi': ConditionalFCNVecT
+}
+
+
+def load_model(path, actions=None):
+    if actions is None:
+        with open('new-dataset/data-improved-descriptions/actions.json', mode='rt') as fp:
+            actions = set(json.load(fp).keys())
+
+    sd = torch.load(path)
+    ks = list(sd.keys())
+
+    print(ks)
+    if len(ks) == 1:
+        vec_size = sd['weights'][0].shape[-1]
+        model = LinearVectorTransform(actions, vec_size)
+    else:
+        if any(['embed' in k for k in ks]):
+            conditioning_method = 'embedding'
+            vec_size = sd['embed_visual.weight'].shape[-1]
+        else:
+            conditioning_method = 'concat'
+            vec_size = [el for k, el in sd.items() if ('net' in k) and ('weight' in k)][0].shape[-1] - len(actions)
+
+        use_bnorm = True
+        activation = 'relu'
+
+        if len([k for k in ks if 'net' in k]) == 2:
+            model = LinearConcatVecT(actions, vec_size, conditioning_method)
+        else:
+            model = ConditionalFCNVecT(actions, vec_size, use_bn=use_bnorm, activation=activation, conditioning_method=conditioning_method)
+
+    model.load_state_dict(sd)
+    return model
