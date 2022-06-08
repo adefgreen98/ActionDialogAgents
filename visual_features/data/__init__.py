@@ -1,4 +1,4 @@
-
+import json
 import os
 import random
 import pickle
@@ -85,8 +85,7 @@ def rework_annotations_path(df, basepath):
 class ActionDataset(Dataset):
     def __init__(self,
                  path='dataset/data-bbxs',
-                 negative_sampling_method='default3',
-                 soft_negatives_nr=2,
+                 cs_type='CS3',
                  image_extension='png',
                  transform=None,
                  **kwargs):
@@ -95,22 +94,35 @@ class ActionDataset(Dataset):
 
         self._stats = __default_dataset_stats__
 
-        # TODO: drop the (train-)split column and select which (train-)split to use
         # annotations dataframe
         self.annotation = pandas.read_csv(self.path / 'dataset_cs_scene_object_nopt_augmented_recep.csv', index_col=0)
+
+        # # ALTERNATIVE OBJECT SPLIT
+        # self.annotation = pandas.read_csv(self.path / 'alternative_obj_split_dataset.csv', index_col=0)
+        # print("USING ALTERNATIVE OBJECT SPLIT")
+
         self.annotation = rework_annotations_path(self.annotation, self.path)  # rework paths for mismatch at top directory
+
+        # # remove 'cook' action
+        for c in ['action_name', 'distractor0_action_name', 'distractor1_action_name', 'distractor2_action_name']:
+            self.annotation.drop(index=self.annotation[self.annotation[c] == 'cook'].index, inplace=True)
+
         self.annotation.index = pandas.Series(range(len(self.annotation)))  # rework index for consistency
+
+        assert cs_type in {'CS3', 'CS4'}
+        self.cs_type = cs_type
 
         self.image_extension = image_extension
 
-        # defining method for sampling negatives
-        assert negative_sampling_method in NEGATIVE_SAMPLING_METHODS
-        self.negative_sampling_method = negative_sampling_method
-        self.soft_negatives_nr = soft_negatives_nr
-
         # TODO: some action indices are missing (8, 13), so I had to workaround by using a new enumeration
         # self.actions_map = dict(set(zip(self.annotation['action_name'].to_list(), self.annotation['action_id'].to_list())))
-        self.actions_map = {ac: i for i, ac in enumerate(list(set(self.annotation['action_name'].to_list())))}
+        self.actions_map = {ac: i for i, ac in enumerate(sorted(list(
+            {el for name in ['distractor0_action_name', 'distractor1_action_name', 'distractor2_action_name'] for el in self.annotation[name]}
+        )))}
+
+        if not os.path.exists(self.path / 'actions.json'):
+            with open(self.path / 'actions.json', mode='wt') as fp:
+                json.dump(self.actions_map, fp)
 
         self.objects = dict(set(zip(
             self.annotation['object_name'].to_list(),
@@ -125,28 +137,56 @@ class ActionDataset(Dataset):
                 transforms.ToTensor(),
                 transforms.Normalize(self._stats['mean'], self._stats['std'])
             ])
+        else:
+            self.transform = transform
 
     def __len__(self):
         return len(self.annotation)
 
 
-    @staticmethod
-    def _read_image_from_annotation_path(path: str):
+    def _read_image_from_annotation_path(self, path: str):
         return Image.open(Path(path))
 
     def __getitem__(self, i) -> dict:
         smp = self.annotation.iloc[i]
-        contrast_paths = [smp[col + "_path"] for col in ['distractor0', 'distractor1', 'distractor2']]
-        contrast_actions = [smp[col + "_action_name"] for col in ['distractor0', 'distractor1', 'distractor2']]
+
+        if self.cs_type == 'CS3':
+            contrast_paths = [smp[col + "_path"] for col in ['distractor0', 'distractor1']]
+            contrast_actions = [smp[col + "_action_name"] for col in ['distractor0', 'distractor1']]
+        else:
+            contrast_paths = [smp[col + "_path"] for col in ['distractor0', 'distractor1', 'distractor2']]
+            contrast_actions = [smp[col + "_action_name"] for col in ['distractor0', 'distractor1', 'distractor2']]
         res = {
             'positive': self.transform(self._read_image_from_annotation_path(smp['after_image_path'])),
+            'pos_path': smp['after_image_path'],
             'before': self.transform(self._read_image_from_annotation_path(smp['before_image_path'])),
+            'before_path': smp['before_image_path'],
             'action': self.actions_map[smp['action_name']],
             'neg_actions': [self.actions_map[ac] for ac in contrast_actions],
             'negatives': [self.transform(self._read_image_from_annotation_path(pth)) for pth in contrast_paths],
+            'neg_paths': contrast_paths,
+            'object': smp['object_name']
         }
         return res
 
+    def getitem_no_images(self, i):
+        smp = self.annotation.iloc[i]
+
+        if self.cs_type == 'CS3':
+            contrast_paths = [smp[col + "_path"] for col in ['distractor0', 'distractor1']]
+            contrast_actions = [smp[col + "_action_name"] for col in ['distractor0', 'distractor1']]
+        else:
+            contrast_paths = [smp[col + "_path"] for col in ['distractor0', 'distractor1', 'distractor2']]
+            contrast_actions = [smp[col + "_action_name"] for col in ['distractor0', 'distractor1', 'distractor2']]
+
+        return {
+            'pos_path': smp['after_image_path'],
+            'before_path': smp['before_image_path'],
+            'action': self.actions_map[smp['action_name']],
+            'neg_actions': [self.actions_map[ac] for ac in contrast_actions],
+            'neg_paths': contrast_paths,
+            'object': smp['object_name']
+        }
 
     @staticmethod
     def _scene_from_path(p) -> str:
@@ -174,7 +214,7 @@ class ActionDataset(Dataset):
 
 
 class VecTransformDataset(Dataset):
-    allowed_holdout_procedures = ['samples', 'object_name', 'scene']
+    allowed_holdout_procedures = ['samples', 'object_name', 'scene', 'action']
 
     def __init__(self,
                  extractor_model='moca-rn',
@@ -182,6 +222,7 @@ class VecTransformDataset(Dataset):
                  override_transform=None,
                  **kwargs):
         self._action_dataset = ActionDataset(**kwargs, transform=transforms.ToTensor())
+        self.cs_type = self._action_dataset.cs_type
 
         self.extractor_model = extractor_model
 
@@ -210,7 +251,8 @@ class VecTransformDataset(Dataset):
         self._internal_split_name_map = {
             'object_name': 'object_split',
             'scene': 'scene_split',
-            'samples': 'sample_split'
+            'samples': 'sample_split',
+            'action': 'action_split'
         }
         self.hold_out_rows = self._action_dataset.annotation[self._internal_split_name_map[self.hold_out_procedure]][lambda el: el == 'test'].index
         self.seen_rows = self._action_dataset.annotation[self._internal_split_name_map[self.hold_out_procedure]][lambda el: el != 'test'].index
@@ -220,16 +262,12 @@ class VecTransformDataset(Dataset):
         return len(self._action_dataset)
 
     def __getitem__(self, item):
-        after_smp = self._action_dataset.annotation.iloc[item]
-        contrast_paths = [after_smp[col + "_path"] for col in ['distractor0', 'distractor1', 'distractor2']]
-        contrast_actions = [after_smp[col + "_action_name"] for col in ['distractor0', 'distractor1', 'distractor2']]
-        res = {
-            'before': self.vectors[after_smp['before_image_path']],
-            'action': self.actions_to_ids[after_smp['action_name']],  # TODO fix issue in ActionDataset to solve also here
-            'positive': self.vectors[after_smp['after_image_path']],
-            'negatives': [self.vectors[pth] for pth in contrast_paths],
-            # 'neg_actions': [self.actions_to_ids[ac] for ac in contrast_actions]
-        }
+        res = self._action_dataset.getitem_no_images(item)
+        res.update({
+            'before': self.vectors[res['before_path']],
+            'positive': self.vectors[res['pos_path']],
+            'negatives': [self.vectors[pth] for pth in res['neg_paths']],
+        })
         return res
 
     def preprocess(self):
@@ -256,6 +294,7 @@ class VecTransformDataset(Dataset):
 
         self.vectors = None
 
+        # gathers all paths of before, after and distractors
         paths = {el for s in [self._action_dataset.annotation[col] for col in self._action_dataset.annotation.columns if "path" in col] for el in s}
 
         def get_vec(pth):
@@ -319,7 +358,8 @@ class VecTransformDataset(Dataset):
         ho_items = {
             'object_name': set(self._action_dataset.annotation.loc[self.hold_out_rows, 'object_name'].to_list()),
             'scene': set(self._action_dataset.annotation.loc[self.hold_out_rows, 'scene'].to_list()),
-            'samples': set(self.hold_out_rows.to_list())
+            'samples': set(self.hold_out_rows.to_list()),
+            'action': set(list(zip(self._action_dataset.annotation.loc[self.hold_out_rows, 'object_name'], self._action_dataset.annotation.loc[self.hold_out_rows, 'action_name'])))
         }
         return ho_items[self.hold_out_procedure]
 
@@ -491,11 +531,10 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
 
         train_set, valid_set, test_set = dataset.split(valid_ratio=valid_ratio, for_regression=False)
 
-        train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size,
-                                               collate_fn=contrastive_collate if (kwargs.get('use_contrastive', False) or kwargs.get('use_infonce', False)) else vect_collate
-                                               )
-        valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=vect_collate)
-        test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=vect_collate)  # here for compatibility, but dataset will be accessed with test_dl.dataset
+        touse_collate = contrastive_collate if (kwargs.get('use_contrastive', False) or kwargs.get('use_infonce', False)) else vect_collate
+        train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=touse_collate)
+        valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=touse_collate)
+        test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=touse_collate)  # here for compatibility, but dataset will be accessed with test_dl.dataset
     else:
         raise ValueError(f"unsupported type of dataset '{dataset_type}'")
     return dataset, train_dl, valid_dl, test_dl

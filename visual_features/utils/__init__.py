@@ -115,6 +115,10 @@ def load_model_from_path(parent_path, nr=None, name=None, device='cuda'):
 
 
 def valtype(v):
+
+    if v is None:
+        return None
+
     s = str(v)
     try:
         return type(eval(s))
@@ -147,10 +151,11 @@ def setup_argparser(config: dict, parser=None):
                 # argument with standard default and no choices --> transform in tuple
                 arg = (arg, )
 
+            tp = valtype(arg[0])
             if len(arg) == 1:
-                parser.add_argument('--{}'.format(name), default=arg[0], type=valtype(arg[0]))
+                parser.add_argument('--{}'.format(name), default=arg[0], type=tp)
             elif len(arg) == 2:
-                parser.add_argument('--{}'.format(name), default=arg[0], choices=arg[-1], type=valtype(arg[0]))
+                parser.add_argument('--{}'.format(name), default=arg[0], choices=arg[-1], type=tp)
             else:
                 raise ValueError(f"incorrect format for argument '{name}'")
 
