@@ -103,7 +103,10 @@ def get_objects_per_action(pth):
 
 
 if __name__ == '__main__':
-    pth = 'new-dataset/data-improved-descriptions/dataset_cs_scene_object_nopt_augmented_recep.csv'
+    from pathlib import Path
+    from visual_features.data import __default_dataset_path__
+    from visual_features.data import __default_dataset_fname__
+    pth = str(Path(__default_dataset_path__, __default_dataset_fname__))
 
     # res = get_before_stats(pth)
     res = get_contrast_stats(pth)

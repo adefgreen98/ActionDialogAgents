@@ -7,24 +7,26 @@ from pathlib import Path
 from pprint import pprint
 
 import matplotlib.pyplot as plt
+import numpy
 import pandas
 import seaborn
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-from abc import ABC, abstractmethod
-from typing import Tuple
-from collections import OrderedDict
 
-import sys
+from torch.nn import functional as F
+from collections import OrderedDict, defaultdict
 
 from tqdm import tqdm
 
+import sys
 sys.path.append('.')  # needed for executing from top directory
+
+import plots
 
 from visual_features.utils import load_model_from_path
 from visual_features.data import get_data
+from visual_features.data import __default_dataset_path__
 from visual_features.utils import setup_argparser, get_optimizer
 from visual_features.data import VecTransformDataset  # needed for hold-out procedures
 
@@ -68,7 +70,7 @@ __default_train_config__ = {
     'statistical_iterations': (5, ),
 
     # Others
-    'data_path': ('new-dataset/data-improved-descriptions',),
+    'data_path': (__default_dataset_path__,),
     'save_model': False,
     'save_path': ('new-vect-results', ),
     'load_path': (None, ),
@@ -339,11 +341,14 @@ def get_savepath(st_path, args, create_dir=True, create_topdir=True):
         st_path = Path(st_path)
 
     os.makedirs(str(st_path), exist_ok=True)
-    names = [name for name in os.listdir(st_path) if len(name.split("_")) >= 2]
-    save_name = f"{max([int(name.split('_')[-2] if name.split('_')[-2].isdigit() else -1) for name in names], default=-1) + 1}_@{args.statistical_iterations}"
-    save_path = st_path / save_name
+
     if create_dir:
+        names = [name for name in os.listdir(st_path) if len(name.split("_")) >= 2]
+        save_name = f"{max([int(name.split('_')[-2] if name.split('_')[-2].isdigit() else -1) for name in names], default=-1) + 1}_@{args.statistical_iterations}"
+        save_path = st_path / save_name
         os.makedirs(save_path, exist_ok=True)
+    else:
+        save_path = st_path
     return save_path
 
 
@@ -362,7 +367,8 @@ def run_training(args, fixed_dataset=None, save_results=True, plot=True, return_
 
     model = get_model(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), args)
     opt, sched = get_optimizer(args, model)
-    loss_fn = torch.nn.MSELoss()
+    loss_fn = torch.nn.MSELoss()  # ONLY USED IN CASE OF NOT CONTRASTIVE NOR INFONCE, here for compatibility reasons
+
     ep_loss_mean = []
     ep_sim_mean = []
     ep_acc_mean = []
@@ -375,7 +381,7 @@ def run_training(args, fixed_dataset=None, save_results=True, plot=True, return_
 
     if not return_test_outs:
         pth = Path(args.save_path, "models", "+".join([args.vect_model, args.extractor_model]))
-        pth = get_savepath(pth, args, create_dir=save_results, create_topdir=args.save_model)
+        pth = get_savepath(pth, args, create_dir=save_results)
         pth = Path(*pth.parts[:-1], args.hold_out_procedure + "_" + str(pth.parts[-1]))
 
     best_acc = -1.0
@@ -460,7 +466,7 @@ def exp_hold_out(args, return_test_outs=False):
     st_path = Path(args.save_path, "statistics", "hold-out")
     save_path = get_savepath(st_path, args, create_topdir=not return_test_outs)
 
-    tested_procedures = ['object_name', 'scene', 'action']
+    tested_procedures = ['structural', 'reversible', 'receptacle', 'surface', 'scene', 'action']
     nr_samples_per_it = {k: [] for k in tested_procedures}
 
     tested_vect_models = _ALLOWED_TRANSFORM_MODULES
@@ -469,9 +475,11 @@ def exp_hold_out(args, return_test_outs=False):
     for stat_it in range(args.statistical_iterations):
         for extractor_model in ['moca-rn', 'clip-rn']:
             for hold_out_procedure in tested_procedures:
-                # needed both these to fix the dataset
+
+                # needed both the following two to fix the dataset
                 args.hold_out_procedure = hold_out_procedure
                 args.extractor_model = extractor_model
+
                 fixed_ds = get_data(**vars(args), dataset_type='vect')
 
                 if not return_test_outs:
@@ -516,7 +524,7 @@ def exp_hold_out(args, return_test_outs=False):
     if return_test_outs:
         return pandas.concat(df, ignore_index=True)
 
-    ### Following part executed only if experiment is executed alone ###
+    # ### Following part executed only if experiment is executed alone ###
     with open(save_path / 'items.txt', mode='at') as f:
         f.write(str({
             'sizes': nr_samples_per_it,
@@ -596,43 +604,42 @@ def exp_fcn_hyperparams(args):
     return df
 
 
-def run_train_regression(args, fixed_dataset=None, save_results=False):
-
-    # Prepares path for saving
-    pth = Path(args.save_path, "regression", "+".join([args.vect_model, args.extractor_model]))
-    pth = get_savepath(pth, args)
-
-    if fixed_dataset is not None:
-        full_dataset, reg_matrices, test_dl = fixed_dataset
-    else:
-        full_dataset, reg_matrices, test_dl = get_data(**vars(args), dataset_type='vect', use_regression=True)
-
-    model = get_model(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), args)
-    model.regression_init(reg_matrices, regression_type='torch')
-
-    print(f"------ TEST ------")
-    test_sim, test_acc, test_df = evaluate(model, test_dl, use_contrasts=True)
-    print("Test sim: ", test_sim)
-    print("Test acc: ", test_acc)
-    print()
-
-    if save_results:
-        os.makedirs(pth, exist_ok=True)
-
-        with open(pth / 'config.json', mode='wt') as f:
-            json.dump(vars(args), f, indent=2)
-
-        pandas.DataFrame({
-            'similarity': test_sim,
-            'accuracy': test_acc,
-            # TODO: what other metrics?
-            # 'time': -1.0
-        }).to_csv(str(pth / 'metrics.csv'), index=False)
-
-    return test_sim, test_acc, full_dataset  # to register hold-out items
-
-
 def exp_regression(args):
+    def run_train_regression(args, fixed_dataset=None, save_results=False):
+
+        # Prepares path for saving
+        pth = Path(args.save_path, "regression", "+".join([args.vect_model, args.extractor_model]))
+        pth = get_savepath(pth, args)
+
+        if fixed_dataset is not None:
+            full_dataset, reg_matrices, test_dl = fixed_dataset
+        else:
+            full_dataset, reg_matrices, test_dl = get_data(**vars(args), dataset_type='vect', use_regression=True)
+
+        model = get_model(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), args)
+        model.regression_init(reg_matrices, regression_type='torch')
+
+        print(f"------ TEST ------")
+        test_sim, test_acc, test_df = evaluate(model, test_dl, use_contrasts=True)
+        print("Test sim: ", test_sim)
+        print("Test acc: ", test_acc)
+        print()
+
+        if save_results:
+            os.makedirs(pth, exist_ok=True)
+
+            with open(pth / 'config.json', mode='wt') as f:
+                json.dump(vars(args), f, indent=2)
+
+            pandas.DataFrame({
+                'similarity': test_sim,
+                'accuracy': test_acc,
+                # TODO: what other metrics?
+                # 'time': -1.0
+            }).to_csv(str(pth / 'metrics.csv'), index=False)
+
+        return test_sim, test_acc, full_dataset  # to register hold-out items
+
     tested_procedures = ['object_name', 'scene']
 
     args.vect_model = 'Action-Matrix'
@@ -690,6 +697,8 @@ def exp_regression(args):
 
 
 def exp_cs_size(args):
+    """Initially planned to run experiments with different contrast-set-sizes (3, 4). Now only used
+    to run hold-out experiments easily and with a better plot."""
     # args.save_path = 'saved-models-exp'
 
     save_path = get_savepath(args.save_path, args)
@@ -707,100 +716,338 @@ def exp_cs_size(args):
 
     full_df.to_csv(save_path / 'outputs.csv', index=False)
 
-    from plots import training as plt_training
-    g = plt_training(save_path / 'outputs.csv', show=False)
+    g = plots.training(save_path / 'outputs.csv', show=False)
 
     g.savefig(save_path / 'results.png')
 
 
-def run_nearest_neighbors(args, k=None):
-    # Given a path, uses the (first) model present in the path to save NN images
-
-    pairwise_distance_fn = lambda prd, other: (1 - torch.cosine_similarity(prd, other)) / 2
-
-    neighbors_path = Path(Path(args.load_path).parent, Path(args.load_path).parts[-1].split("@")[0] + "neighbors")
-
-    if not os.path.exists(neighbors_path):
-        os.mkdir(neighbors_path)
-
-        args.extractor_model = Path(args.load_path).parent.parts[-1].split("+")[-1]
-        ho_proc = Path(args.load_path).parts[-1].split("@")[0]
-        ho_proc = "_".join(ho_proc.split("_")[:-2])  # needed to merge object_name
-        args.hold_out_procedure = ho_proc
-        full_dataset, _, _, test_dl = get_data(**vars(args), dataset_type='vect')
-
-        model = load_model(args.load_path, actions=set(full_dataset.ids_to_actions.keys()))
-        model.eval()
-
-        neighbors_pool = {}
-        predictions = {}
-
-        ds = test_dl.dataset
-
-        with torch.no_grad():
-            for i in tqdm(range(len(ds)), desc='Extracting vectors...'):
-                smp = ds[i]
-                before = smp['before'].unsqueeze(0).to(model.device)
-                action = torch.tensor(smp['action'], dtype=torch.long).unsqueeze(0).to(model.device)
-                positive = smp['positive'].unsqueeze(0).to(model.device)
-                negatives = torch.stack(smp['negatives'], dim=0).unsqueeze(0).to(model.device)
-
-                _, pred, positive, negatives = model(before, action, positive, negatives)
-
-                pred = pred.to('cpu')
-                positive = positive.to('cpu')
-                negatives = negatives.to('cpu').squeeze()
-
-                if neighbors_pool.get(smp['pos_path'], None) is None:
-                    neighbors_pool[smp['pos_path']] = positive
-
-                for i, npath in enumerate(smp['neg_paths']):
-                    if neighbors_pool.get(npath, None) is None:
-                        neighbors_pool[npath] = negatives[i]
-
-                predictions[smp['pos_path']] = {
-                    'vec': pred,
-                    'before': smp['before_path']
-                }
-
-        with open(Path(neighbors_path, 'pred.pkl'), mode='wb') as fp:
-            pickle.dump(predictions, fp)
-
-        with open(Path(neighbors_path, 'neighbors.pkl'), mode='wb') as fp:
-            pickle.dump(neighbors_pool, fp)
-    else:
-        with open(Path(neighbors_path, 'pred.pkl'), mode='rb') as fp:
-            predictions = pickle.load(fp)
-
-        with open(Path(neighbors_path, 'neighbors.pkl'), mode='rb') as fp:
-            neighbors_pool = pickle.load(fp)
-
-    if not os.path.exists(Path(neighbors_path, 'ranking.csv')):
-        scores_df = []
-        for pred_pth in tqdm(predictions, desc='Computing distances...'):
-            scores = [(pth, pairwise_distance_fn(predictions[pred_pth]['vec'], neighbors_pool[pth])) for pth in neighbors_pool if pth != pred_pth]
-            ranked_neighbors = [tp[0] for tp in sorted(scores, key=lambda el: el[1], reverse=False)]
-            if k is not None and k > 0:
-                ranked_neighbors = ranked_neighbors[:k]
-
-            scores_df.append({'pth': pred_pth, 'neighbors': ranked_neighbors})
-
-        scores_df = pandas.DataFrame(scores_df)
-        scores_df.to_csv(Path(neighbors_path, 'ranking.csv'), index=False)
-
-        return scores_df
-    else:
-        return pandas.read_csv(Path(neighbors_path, 'ranking.csv'))
-
-
 def exp_nearest_neighbors(args, k=None):
-    for r, d, fnames in os.walk(args.load_path):
-        for fname in fnames:
-            if fname.endswith('.pth'):
+    """Computes ranking of all test images (positives and negatives) for each predicted vector
+    (= transformed before vector), by using the cosine similarity as a measure of distance.
+    Executes for all models that can be found in subfolders, thus it should be executed carefully when
+    there are more than 1 statistical iteration."""
+
+    # Command:
+    # source run_script.sh 1 multimodal/vector_transform.py --exp_nearest_neighbors --load_path ./experiment-nearest-neighbors/models
+
+    def run_nearest_neighbors(args, k=None):
+        # Given a path, uses the (first) model present in the path to save NN images
+
+        pairwise_distance_fn = lambda prd, other: (1 - torch.cosine_similarity(prd, other)) / 2
+
+        neighbors_path = Path(Path(args.load_path).parent, Path(args.load_path).parts[-1].split("@")[0] + "neighbors")
+
+        if not os.path.exists(neighbors_path):
+            os.mkdir(neighbors_path)
+
+            args.extractor_model = Path(args.load_path).parent.parts[-1].split("+")[-1]
+            ho_proc = Path(args.load_path).parts[-1].split("@")[0]
+            ho_proc = "_".join(ho_proc.split("_")[:-2])  # needed to merge object_name
+            args.hold_out_procedure = ho_proc
+            full_dataset, _, _, test_dl = get_data(**vars(args), dataset_type='vect')
+
+            model = load_model(args.load_path, actions=set(full_dataset.ids_to_actions.keys()))
+            model.eval()
+
+            neighbors_pool = {}
+            predictions = {}
+
+            ds = test_dl.dataset
+
+            with torch.no_grad():
+                for i in tqdm(range(len(ds)), desc='Extracting vectors...'):
+                    smp = ds[i]
+                    before = smp['before'].unsqueeze(0).to(model.device)
+                    action = torch.tensor(smp['action'], dtype=torch.long).unsqueeze(0).to(model.device)
+                    positive = smp['positive'].unsqueeze(0).to(model.device)
+                    negatives = torch.stack(smp['negatives'], dim=0).unsqueeze(0).to(model.device)
+
+                    _, pred, positive, negatives = model(before, action, positive, negatives)
+
+                    pred = pred.to('cpu')
+                    positive = positive.to('cpu')
+                    negatives = negatives.to('cpu').squeeze()
+
+                    if neighbors_pool.get(smp['pos_path'], None) is None:
+                        neighbors_pool[smp['pos_path']] = positive
+
+                    for i, npath in enumerate(smp['neg_paths']):
+                        if neighbors_pool.get(npath, None) is None:
+                            neighbors_pool[npath] = negatives[i]
+
+                    predictions[smp['pos_path']] = {
+                        'vec': pred,
+                        'before': smp['before_path']
+                    }
+
+            with open(Path(neighbors_path, 'pred.pkl'), mode='wb') as fp:
+                pickle.dump(predictions, fp)
+
+            with open(Path(neighbors_path, 'neighbors.pkl'), mode='wb') as fp:
+                pickle.dump(neighbors_pool, fp)
+        else:
+            with open(Path(neighbors_path, 'pred.pkl'), mode='rb') as fp:
+                predictions = pickle.load(fp)
+
+            with open(Path(neighbors_path, 'neighbors.pkl'), mode='rb') as fp:
+                neighbors_pool = pickle.load(fp)
+
+        if not os.path.exists(Path(neighbors_path, 'ranking.csv')):
+            scores_df = []
+            for pred_pth in tqdm(predictions, desc='Computing distances...'):
+                # # Excluding ground truth path
+                # scores = [(pth, pairwise_distance_fn(predictions[pred_pth]['vec'], neighbors_pool[pth])) for pth in
+                #           neighbors_pool if pth != pred_pth]
+                scores = [(pth, pairwise_distance_fn(predictions[pred_pth]['vec'], neighbors_pool[pth])) for pth in
+                          neighbors_pool]
+                ranked_neighbors = [tp[0] for tp in sorted(scores, key=lambda el: el[1], reverse=False)]
+                if k is not None and k > 0:
+                    ranked_neighbors = ranked_neighbors[:k]
+
+                scores_df.append({'pth': pred_pth, 'neighbors': ranked_neighbors})
+
+            scores_df = pandas.DataFrame(scores_df)
+            scores_df.to_csv(Path(neighbors_path, 'ranking.csv'), index=False)
+
+            return scores_df
+        else:
+            return pandas.read_csv(Path(neighbors_path, 'ranking.csv'))
+
+    # ############## Terminates wrapped function ###############
+
+    if not os.path.exists(Path(args.load_path, 'stats_results.csv')):
+        for r, d, fnames in os.walk(args.load_path):
+            for fname in fnames:
+                if fname.endswith('.pth'):
+                    tmpargs = Namespace(**vars(args))
+                    tmpargs.load_path = os.path.join(r, fname)
+                    print(f"------------ NN Experiment for {str(Path(tmpargs.load_path).parent.parts[-1])} ------------")
+                    run_nearest_neighbors(tmpargs, k)
+
+    if not os.path.exists(Path(Path(args.load_path).parent, 'images-with-before')):
+        plots.nearest_samples(args.load_path)
+
+    metrics = plots.stats_nearest_samples(args.load_path, savefig=True)
+
+    return metrics
+
+
+def exp_neighbor_mds(args):
+    import shutil
+    from sklearn.manifold import MDS
+    from visual_features.data import load_and_rework_csv
+    from visual_features.data import __default_dataset_fname__ as dataset_fname
+
+    ann_df = load_and_rework_csv(args.data_path, dataset_fname)
+
+    path2action = dict([
+        *list(zip(ann_df.after_image_path, ann_df.action_name)),
+        *[tp for c in [0,1,2] for tp in zip(ann_df[f"distractor{c}_path"], ann_df[f"distractor{c}_action_name"])]
+    ])  # should NOT be the case that 2 same paths have different actions when in different columns...
+
+    def get_action(pth):
+        return path2action[pth]
+
+    def run_mds(args):
+        tosave_pth = args.load_path
+
+        with open(Path(args.load_path, 'neighbors.pkl'), mode='rb') as fp:
+            vecs = pickle.load(fp)
+        with open(Path(args.load_path, 'pred.pkl'), mode='rb') as fp:
+            preds = pickle.load(fp)
+
+        # Run mds
+        reduction = MDS(
+            n_components=2,
+            metric=True,
+            dissimilarity='euclidean'  # TODO change this to precomputed?
+        )
+
+        separator = len(vecs)
+
+        if not os.path.exists(Path(args.load_path, 'mds.pkl')):
+
+            v = numpy.vstack([
+                *[el.squeeze().numpy() for el in vecs.values()],
+                *[el['vec'].squeeze().numpy() for el in preds.values()]
+            ]).astype(numpy.float64)
+
+            print('Transforming...')
+            overall_vec = reduction.fit_transform(v)
+            print("Done!")
+
+            with open(Path(args.load_path, 'mds.pkl'), mode='wb') as fp:
+                pickle.dump(overall_vec, fp)
+        else:
+            with open(Path(args.load_path, 'mds.pkl'), mode='rb') as fp:
+                overall_vec = pickle.load(fp)
+            print(f"Loaded MDS from {str(Path(args.load_path, 'mds.pkl'))}")
+
+        projected_vecs = overall_vec[:separator]
+        projected_preds = overall_vec[separator:]
+
+        projected_vecs = {
+            'vec': projected_vecs,
+            'category': [get_action(pth) for pth in vecs]
+        }
+        projected_preds = {
+            'vec': projected_preds,
+            'category': [get_action(pth) for pth in preds]
+        }
+
+        # Plot mds points with colors associated
+        fig = plots.mds(projected_vecs, projected_preds, plots.shorten_model_name(str(Path(*Path(args.load_path).parts[-2:]))), show=False)
+        fig.savefig(Path(tosave_pth) / 'mds-actions.png')
+    # #################### End wrap ####################
+
+    for r, dnames, fs in os.walk(args.load_path):
+        for dname in dnames:
+            if "_neighbors" in dname:
                 tmpargs = Namespace(**vars(args))
-                tmpargs.load_path = os.path.join(r, fname)
-                print(f"------------ NN Experiment for {str(Path(tmpargs.load_path).parent.parts[-1])} ------------")
-                run_nearest_neighbors(tmpargs, k)
+                tmpargs.load_path = os.path.join(r, dname)
+                print(f"------------ MDS Experiment for {str(Path(*Path(tmpargs.load_path).parts[-2:]))} ------------")
+                run_mds(tmpargs)
+
+    # Copies all images in the same directory for prettier visualization
+    os.mkdir(Path(args.load_path, 'mds-images'))
+    for r, dnames, fs in os.walk(args.load_path):
+        if r.endswith("_neighbors"):
+            new_fname = plots.shorten_model_name(str(Path(*Path(r.replace("_neighbors", "")).parts[-2:])))
+            new_fpath = Path(args.load_path, 'mds-images', new_fname + '.png')
+            shutil.copyfile(str(Path(r, 'mds-actions.png')), str(new_fpath))
+
+
+def exp_action_crossval(args):
+    def generate_combinations(annotation_dataframe, max_combs_per_action=5):
+        """Generates combinations of each action with object-action pairings containing all possible objects for that action.
+        In order to maintain consistency, for each action, every combination contains the same object-action pairings except
+        for that action. However, these combinations are not necessarily shared across actions."""
+        from random import choice
+
+        # Retrieves all combinations
+        existent_combinations = defaultdict(set)
+        for a, o in zip(annotation_dataframe.action_name, annotation_dataframe.object_name):
+            existent_combinations[a].update((o,))
+
+        # sort actions by name so that coherence is preserved
+        existent_combinations = {k: list(existent_combinations[k]) for k in sorted(existent_combinations)}
+
+        res = {}
+
+        for ac in tqdm(existent_combinations, desc='generating combinations...'):
+            comb = None
+            interrupt = False
+            ac_cfgs = []
+            while not interrupt:
+                # assigns action to object, then checks length if there has been repeated assignment
+                comb = {choice(existent_combinations[cmb_ac]): cmb_ac
+                        for cmb_ac in existent_combinations if cmb_ac != ac}
+
+                # If first, should generate avoiding superpositions
+                # Otherwise, in case:
+                #  - curr action A
+                #  - other action B
+                #  - current object o1 belongs to A but is assigned to B
+                # if exists an object shared by the two actions (which will be used in some configuration for A)
+                # then choses it for B, thus "swapping" them, otherwise choses a random object for B
+
+                if len(comb) != (len(existent_combinations) - 1):
+                    pass  # completely invalid configuration, multiple objects for the same action
+                else:
+                    for obj in existent_combinations[ac]:
+                        tmp = comb.copy()
+                        if comb.get(obj, None) is not None:
+                            other_ac = comb[obj]
+                            possible_objs = set(existent_combinations[other_ac]).difference({k for k in comb})
+                            if len(possible_objs) == 0:
+                                # no alternative objects for this concurrent action --> should rebuild the combination
+                                ac_cfgs = []
+                                break
+
+                            shared_objs = possible_objs.intersection(set(existent_combinations[ac]))
+                            if len(shared_objs) > 0:
+                                # chooses another object from the shared set, excluding the current one
+                                possible_objs = shared_objs.difference({obj})
+                            tmp[choice(list(possible_objs))] = other_ac
+
+                        tmp[obj] = ac
+                        tmp = {v: k for k, v in tmp.items()}
+                        tmp = {k: tmp[k] for k in sorted(tmp)}
+                        ac_cfgs.append(list(tmp.items()))
+
+                if len(ac_cfgs) == len(existent_combinations[ac]):
+                    # generated all necessary configs
+                    interrupt = True
+
+            res[ac] = ac_cfgs
+
+        res = {ac: res[ac][:max_combs_per_action] for ac in res}
+        return res
+
+    # Hard-coded params
+    args.activation = 'relu'
+    args.use_bn = True
+
+    save_path = get_savepath(args.save_path, args, create_topdir=True, create_dir=False)
+
+    nr_samples_per_it = []  # nr test samples
+
+    tested_vect_models = _ALLOWED_TRANSFORM_MODULES
+
+    df = []
+
+    tosave_combinations = {'moca-rn': None,
+                           'clip-rn': None}  # lists of combinations used for each model saved in .json
+
+    for extractor_model in ['moca-rn', 'clip-rn']:
+        # needed both the following two to fix the dataset
+        args.hold_out_procedure = 'action'
+        args.extractor_model = extractor_model
+
+        fixed_ds = get_data(**vars(args), dataset_type='vect')
+
+        annotation_df = fixed_ds[0].get_annotation()  # seen/unseen split does not matter, only needed for action-objects associations
+        test_combinations = generate_combinations(annotation_df)
+        tosave_combinations[extractor_model] = test_combinations
+
+        for i_ac, curr_action in enumerate(test_combinations):  # select action to cross-validate with its objects configurations
+            for i_comb, current_test_combination in enumerate(test_combinations[curr_action]):
+                print()
+                print(f"~~~~~~~~~~~~~~~~~ {extractor_model.upper()}, Action {i_ac + 1}/{len(test_combinations)}, Comb {i_comb + 1}/{len(test_combinations[curr_action])} ~~~~~~~~~~~~~~~~~")
+                print()
+
+                for stat_it in range(args.statistical_iterations):
+
+                    # place initialization here so that each time training & validation are randomized
+                    fixed_ds = fixed_ds[0].change_action_split(current_test_combination, args.batch_size)
+
+                    nr_samples_per_it.append(fixed_ds[0].get_nr_hold_out_samples())
+
+                    for vect_model in tested_vect_models:
+                        args.vect_model = vect_model
+                        _, _, ds = run_training(args, fixed_dataset=fixed_ds, save_results=False, plot=False,
+                                                return_test_outs=True)
+
+                        # ds = dataframe containing all outputs from the current model
+                        ds['hold_out_procedure'] = 'action'
+                        ds['extractor_model'] = extractor_model
+                        ds['vect_model'] = args.vect_model
+                        ds['iteration'] = stat_it
+                        ds['tested_object'] = [_obj for _ac, _obj in current_test_combination if _ac == curr_action][0]
+                        ds['tested_action'] = curr_action
+                        df.append(ds)
+
+    with open(save_path / 'action-object-combinations.json', mode='wt') as fp:
+        json.dump(tosave_combinations, fp, indent=2)
+
+    outs = pandas.concat(df, ignore_index=True)
+    outspth = save_path / 'outputs.csv'
+    outs.to_csv(outspth, index=False)
+
+    g = plots.action_crossval(outspth, show=False, savefig=True)
+    # g.savefig(save_path / 'results.png')
+
+    return outs
 
 
 if __name__ == '__main__':
@@ -811,6 +1058,8 @@ if __name__ == '__main__':
     parser.add_argument('--exp_regression', action='store_true')
     parser.add_argument('--exp_cs_size', action='store_true')
     parser.add_argument('--exp_nearest_neighbors', action='store_true')
+    parser.add_argument('--exp_action_crossval', action='store_true')
+    parser.add_argument('--exp_neighbor_mds', action='store_true')
 
     parser = setup_argparser(__default_train_config__, parser)
     args = parser.parse_args()
@@ -834,13 +1083,22 @@ if __name__ == '__main__':
         res = exp_cs_size(args)
     elif args.exp_nearest_neighbors:
         res = exp_nearest_neighbors(args)
+    elif args.exp_action_crossval:
+        res = exp_action_crossval(args)
+    elif args.exp_neighbor_mds:
+        res = exp_neighbor_mds(args)
     else:
-        full_dataset, _, _, hold_dl = get_data('dataset/data-bbxs', dataset_type='vect', hold_out_procedure='object_name', hold_out_size=4, extractor_model='clip-rn')
-        # model = LinearConcatVecT(set(full_dataset.ids_to_actions.keys()), full_dataset.get_vec_size(), device='cuda').to('cuda')
-        # print(model)
-        print(full_dataset.after_vectors.loc[0, 'vector'].shape)
-        # print(evaluate(model, hold_dl, use_contrasts=True))
-
-
-
-
+        # Debug scripts
+        for r, d, fnames in os.walk('./experiment-nearest-neighbors/models'):
+            if r.endswith("_neighbors"):
+                print(r)
+                with open(os.path.join(r, 'neighbors.pkl'), mode='rb') as fp:
+                    n = pickle.load(fp)
+                with open(os.path.join(r, 'pred.pkl'), mode='rb') as fp:
+                    p = pickle.load(fp)
+                with open(os.path.join(r, 'mds.pkl'), mode='rb') as fp:
+                    mds = pickle.load(fp)
+                print(len(n), " | ", len(p), " | ", len(mds), f"({len(n) + len(p)})", sep='     ')
+                del n
+                del p
+                del mds
