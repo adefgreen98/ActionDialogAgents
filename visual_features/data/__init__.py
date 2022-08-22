@@ -19,10 +19,16 @@ from tqdm import tqdm
 
 from torch.nn.utils.rnn import pad_sequence
 
+import itertools
+
 import sys
+
 sys.path.extend(['..', '.'])
 
 from visual_features.vision_helper.utils import collate_fn as default_collate_fn
+
+__default_dataset_fname__ = 'dataset_with_new_splits.csv'
+__default_dataset_path__ = 'new-dataset/data-improved-descriptions'
 
 NEGATIVE_SAMPLING_METHODS = [
     'fixed_onlyhard',
@@ -44,17 +50,17 @@ ACTION_CONVERSION_TABLE = {
 
 # TODO update this set
 # here not to be used dynamically but only as a reference
-__bbox_target_categories__ = {'CellPhone', 'Pen', 'Towel', 'Candle', 'SoapBar', 'Footstool', 'BaseballBat', 'WateringCan',
-                         'SoapBottle', 'Egg', 'DishSponge', 'Book', 'HandTowel', 'Ladle', 'Pencil', 'Plunger', 'Kettle',
-                         'Lettuce', 'TeddyBear', 'TableTopDecor', 'Box', 'Bowl', 'AluminumFoil', 'Plate', 'Pillow',
-                         'Vase', 'Mug', 'Pan', 'Pot', 'RemoteControl', 'KeyChain', 'SaltShaker', 'SprayBottle', 'Cup',
-                         'TennisRacket', 'Boots', 'Bread', 'Bottle', 'Knife', 'CD', 'Potato', 'Tomato', 'Newspaper',
-                         'Watch', 'CreditCard', 'Dumbbell', 'ButterKnife', 'TissueBox', 'Statue', 'AlarmClock',
-                         'Spatula', 'ToiletPaper', 'Cloth', 'ScrubBrush', 'Fork', 'Laptop', 'BasketBall', 'WineBottle',
-                         'PepperShaker', 'Spoon', 'Apple', 'PaperTowelRoll'}
+__bbox_target_categories__ = {
+    'CellPhone', 'Pen', 'Towel', 'Candle', 'SoapBar', 'Footstool', 'BaseballBat', 'WateringCan',
+    'SoapBottle', 'Egg', 'DishSponge', 'Book', 'HandTowel', 'Ladle', 'Pencil', 'Plunger', 'Kettle',
+    'Lettuce', 'TeddyBear', 'TableTopDecor', 'Box', 'Bowl', 'AluminumFoil', 'Plate', 'Pillow',
+    'Vase', 'Mug', 'Pan', 'Pot', 'RemoteControl', 'KeyChain', 'SaltShaker', 'SprayBottle', 'Cup',
+    'TennisRacket', 'Boots', 'Bread', 'Bottle', 'Knife', 'CD', 'Potato', 'Tomato', 'Newspaper',
+    'Watch', 'CreditCard', 'Dumbbell', 'ButterKnife', 'TissueBox', 'Statue', 'AlarmClock',
+    'Spatula', 'ToiletPaper', 'Cloth', 'ScrubBrush', 'Fork', 'Laptop', 'BasketBall', 'WineBottle',
+    'PepperShaker', 'Spoon', 'Apple', 'PaperTowelRoll'}
 
 __nr_bbox_target_categories__ = len(__bbox_target_categories__)
-
 
 __default_dataset_stats__ = {
     'mean': torch.tensor([0.4689, 0.4682, 0.4712]),
@@ -72,19 +78,32 @@ def convert_action(name: str):
     return ACTION_CONVERSION_TABLE[int(name)]
 
 
-def rework_annotations_path(df, basepath):
-    # TODO: automatic handling of different path specifications
-    # df['after_image_path'] = df['after_image_path'].map(lambda pth: str(Path(*basepath.parts[:-1], pth)))
-    # df['before_image_path'] = df['before_image_path'].map(lambda pth: str(Path(*basepath.parts[:-1], pth)))
-    for col in df.columns:
-        if "path" in col:
-            df[col] = df[col].map(lambda pth: str(Path(*basepath.parts[:-1], pth)))
+def load_and_rework_csv(basepath, dfname):
+    """Loads the annotation DataFrame from the specified csv file and reworks paths to coincide
+     with the specified basepath. Also drops contrasts (rows) where
+    the action is 'cook' is present either as positive or negative."""
+    from pathlib import Path
+    basepath = Path(basepath)
+    df = pandas.read_csv(basepath / dfname, index_col=0)
+
+    def rework_annotations_path(_df, _basepath):
+        # TODO: automatic handling of different path specifications
+        for col in _df.columns:
+            if "path" in col:
+                _df[col] = _df[col].map(lambda pth: str(Path(*_basepath.parts[:-1], pth)))
+        return _df
+
+    df = rework_annotations_path(df, basepath)
+    for c in ['action_name', 'distractor0_action_name', 'distractor1_action_name', 'distractor2_action_name']:
+        df.drop(index=df[df[c] == 'cook'].index, inplace=True)
+    df.index = pandas.Series(range(len(df)))
+
     return df
 
 
 class ActionDataset(Dataset):
     def __init__(self,
-                 path='dataset/data-bbxs',
+                 path=__default_dataset_path__,
                  cs_type='CS3',
                  image_extension='png',
                  transform=None,
@@ -95,19 +114,21 @@ class ActionDataset(Dataset):
         self._stats = __default_dataset_stats__
 
         # annotations dataframe
-        self.annotation = pandas.read_csv(self.path / 'dataset_cs_scene_object_nopt_augmented_recep.csv', index_col=0)
+        self.annotation = load_and_rework_csv(self.path, __default_dataset_fname__)
+
+        # self.annotation = pandas.read_csv(self.path / 'dataset_cs_scene_object_nopt_augmented_recep.csv', index_col=0)
 
         # # ALTERNATIVE OBJECT SPLIT
-        # self.annotation = pandas.read_csv(self.path / 'alternative_obj_split_dataset.csv', index_col=0)
+        # self.annotation = load_and_rework_csv(self.path, 'alternative_obj_split_dataset.csv')
         # print("USING ALTERNATIVE OBJECT SPLIT")
 
-        self.annotation = rework_annotations_path(self.annotation, self.path)  # rework paths for mismatch at top directory
-
-        # # remove 'cook' action
-        for c in ['action_name', 'distractor0_action_name', 'distractor1_action_name', 'distractor2_action_name']:
-            self.annotation.drop(index=self.annotation[self.annotation[c] == 'cook'].index, inplace=True)
-
-        self.annotation.index = pandas.Series(range(len(self.annotation)))  # rework index for consistency
+        # self.annotation = rework_annotations_path(self.annotation, self.path)  # rework paths for mismatch at top directory
+        #
+        # # # remove 'cook' action
+        # for c in ['action_name', 'distractor0_action_name', 'distractor1_action_name', 'distractor2_action_name']:
+        #     self.annotation.drop(index=self.annotation[self.annotation[c] == 'cook'].index, inplace=True)
+        #
+        # self.annotation.index = pandas.Series(range(len(self.annotation)))  # rework index for consistency
 
         assert cs_type in {'CS3', 'CS4'}
         self.cs_type = cs_type
@@ -115,9 +136,9 @@ class ActionDataset(Dataset):
         self.image_extension = image_extension
 
         # TODO: some action indices are missing (8, 13), so I had to workaround by using a new enumeration
-        # self.actions_map = dict(set(zip(self.annotation['action_name'].to_list(), self.annotation['action_id'].to_list())))
         self.actions_map = {ac: i for i, ac in enumerate(sorted(list(
-            {el for name in ['distractor0_action_name', 'distractor1_action_name', 'distractor2_action_name'] for el in self.annotation[name]}
+            {el for name in ['distractor0_action_name', 'distractor1_action_name', 'distractor2_action_name'] for el in
+             self.annotation[name]}
         )))}
 
         if not os.path.exists(self.path / 'actions.json'):
@@ -142,7 +163,6 @@ class ActionDataset(Dataset):
 
     def __len__(self):
         return len(self.annotation)
-
 
     def _read_image_from_annotation_path(self, path: str):
         return Image.open(Path(path))
@@ -190,7 +210,8 @@ class ActionDataset(Dataset):
 
     @staticmethod
     def _scene_from_path(p) -> str:
-        raise RuntimeError("this was used before migrating to scene-as-directory file structure, it is not intended to be used.")
+        raise RuntimeError(
+            "this was used before migrating to scene-as-directory file structure, it is not intended to be used.")
 
     @staticmethod
     def obj_from_path(p) -> str:
@@ -206,7 +227,8 @@ class ActionDataset(Dataset):
             # tmp[lambda df: df['after_image_path'].isnull()]['after_image_path'] = tmp[lambda df: df['after_image_path'].isnull()]['before_image_path']
             acc = torch.stack([
                 to_tensor(Image.open(pth))
-                for pth in set(self.annotation['after_image_path'].to_list() + self.annotation['before_image_path'].to_list())
+                for pth in
+                set(self.annotation['after_image_path'].to_list() + self.annotation['before_image_path'].to_list())
             ]).view(3, -1)
             self._stats = {'mean': acc.mean(dim=-1), 'std': acc.std(dim=-1)}
 
@@ -214,7 +236,16 @@ class ActionDataset(Dataset):
 
 
 class VecTransformDataset(Dataset):
-    allowed_holdout_procedures = ['samples', 'object_name', 'scene', 'action']
+    allowed_holdout_procedures = ['object_name',
+                                  'scene',
+                                  'samples',
+
+                                  'action',
+
+                                  'structural',
+                                  'reversible',
+                                  'receptacle',
+                                  'surface']
 
     def __init__(self,
                  extractor_model='moca-rn',
@@ -247,16 +278,24 @@ class VecTransformDataset(Dataset):
             with open(self.path / 'vectors.pkl', mode='rb') as vpth:
                 self.vectors = pickle.load(vpth)
 
-
+        # Please modify this to add new hold out procedures
         self._internal_split_name_map = {
             'object_name': 'object_split',
             'scene': 'scene_split',
             'samples': 'sample_split',
-            'action': 'action_split'
-        }
-        self.hold_out_rows = self._action_dataset.annotation[self._internal_split_name_map[self.hold_out_procedure]][lambda el: el == 'test'].index
-        self.seen_rows = self._action_dataset.annotation[self._internal_split_name_map[self.hold_out_procedure]][lambda el: el != 'test'].index
 
+            'action': 'action_split',
+
+            'structural': 'structural_split',
+            'reversible': 'reversible_split',
+            'receptacle': 'receptacle_split',
+            'surface': 'surface_split'
+        }
+
+        self.hold_out_rows = self._action_dataset.annotation[self._internal_split_name_map[self.hold_out_procedure]][
+            lambda el: el == 'test'].index
+        self.seen_rows = self._action_dataset.annotation[self._internal_split_name_map[self.hold_out_procedure]][
+            lambda el: el != 'test'].index
 
     def __len__(self):
         return len(self._action_dataset)
@@ -295,18 +334,19 @@ class VecTransformDataset(Dataset):
         self.vectors = None
 
         # gathers all paths of before, after and distractors
-        paths = {el for s in [self._action_dataset.annotation[col] for col in self._action_dataset.annotation.columns if "path" in col] for el in s}
+        paths = {el for s in [self._action_dataset.annotation[col] for col in self._action_dataset.annotation.columns if
+                              "path" in col] for el in s}
 
         def get_vec(pth):
             return extractor(transform(Image.open(pth)).unsqueeze(0).to(extractor.device)).squeeze().cpu()
 
         with torch.no_grad():
             self.vectors = {
-                pth: get_vec(pth) for pth in tqdm(paths, desc=f"Extracting visual vectors with {self.extractor_model}...")
+                pth: get_vec(pth) for pth in
+                tqdm(paths, desc=f"Extracting visual vectors with {self.extractor_model}...")
             }
 
         return self.vectors
-
 
     def split(self, valid_ratio=-1.0, for_regression=False):
         """Splits dataset with the current hold-out settings (defined in initialization). An additional parameter
@@ -319,8 +359,10 @@ class VecTransformDataset(Dataset):
             train_after = {action: [] for action in set(self.actions_to_ids.values())}
             train_before = {action: [] for action in set(self.actions_to_ids.values())}
             for i, after_row in train_after_df.iterrows():
-                train_after[self.actions_to_ids[after_row['action_name']]].append(self.vectors[after_row['after_image_path']])
-                train_before[self.actions_to_ids[after_row['action_name']]].append(self.vectors[after_row['before_image_path']])
+                train_after[self.actions_to_ids[after_row['action_name']]].append(
+                    self.vectors[after_row['after_image_path']])
+                train_before[self.actions_to_ids[after_row['action_name']]].append(
+                    self.vectors[after_row['before_image_path']])
 
             vec_dtype = list(self.vectors.values())[0].dtype
             vec_device = list(self.vectors.values())[0].device
@@ -329,7 +371,8 @@ class VecTransformDataset(Dataset):
                     train_after[action] = torch.stack(train_after[action], dim=0)
                     train_before[action] = torch.stack(train_before[action], dim=0)
                 else:
-                    print(f"Not found samples for action {self.ids_to_actions[action]}, hold out set is {self.get_hold_out_items()}")
+                    print(
+                        f"Not found samples for action {self.ids_to_actions[action]}, hold out set is {self.get_hold_out_items()}")
                     train_after[action] = torch.tensor([[]], dtype=vec_dtype, device=vec_device)
                     train_before[action] = torch.tensor([[]], dtype=vec_dtype, device=vec_device)
 
@@ -351,6 +394,36 @@ class VecTransformDataset(Dataset):
                 valid = Subset(train, [])
                 return train, valid, hold_out
 
+    def change_action_split(self, combination, batch_size, valid_ratio=0.2):
+        """Changes the test set by associating new unique objects for each action.
+        Needs parameters to `get_data` because actually instantiates DataLoaders too."""
+
+        def local(row):
+            return 'test' if any([(row.action_name == ac) and (row.object_name == obj)
+                                  for ac, obj in combination]) else 'train'
+
+        self._action_dataset.annotation['action_split'] = self._action_dataset.annotation.apply(lambda row: local(row),
+                                                                                                axis=1)
+
+        indices = self._action_dataset.annotation[lambda df: df.action_split == 'train'].index.tolist()
+        random.shuffle(indices)
+        valid_indices = indices[:int(0.2 * len(indices))]
+
+        self._action_dataset.annotation.at[pandas.Series(valid_indices), "action_split"] = 'valid'
+
+        self.hold_out_rows = self._action_dataset.annotation[lambda df: df.action_split == 'test'].index
+        self.seen_rows = self._action_dataset.annotation[lambda df: df.action_split != 'test'].index
+
+        # DataLoaders
+        train_set, valid_set, test_set = self.split(for_regression=False, valid_ratio=valid_ratio)
+
+        touse_collate = contrastive_collate  # NOTE: assuming usage of InfoNCE for simplicity
+        train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=touse_collate)
+        valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=touse_collate)
+        test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=touse_collate)
+
+        return self, train_dl, valid_dl, test_dl
+
     def get_vec_size(self):
         return list(self.vectors.values())[0].shape[-1]
 
@@ -359,12 +432,16 @@ class VecTransformDataset(Dataset):
             'object_name': set(self._action_dataset.annotation.loc[self.hold_out_rows, 'object_name'].to_list()),
             'scene': set(self._action_dataset.annotation.loc[self.hold_out_rows, 'scene'].to_list()),
             'samples': set(self.hold_out_rows.to_list()),
-            'action': set(list(zip(self._action_dataset.annotation.loc[self.hold_out_rows, 'object_name'], self._action_dataset.annotation.loc[self.hold_out_rows, 'action_name'])))
+            'action': set(list(zip(self._action_dataset.annotation.loc[self.hold_out_rows, 'object_name'],
+                                   self._action_dataset.annotation.loc[self.hold_out_rows, 'action_name'])))
         }
         return ho_items[self.hold_out_procedure]
 
     def get_nr_hold_out_samples(self):
         return len(self.hold_out_rows)
+
+    def get_annotation(self):
+        return self._action_dataset.annotation
 
 
 class BBoxDataset(torch.utils.data.Dataset):
@@ -398,9 +475,11 @@ class BBoxDataset(torch.utils.data.Dataset):
                 added_before_samples[row['before_image_path']] = tmp
 
         self._annotations = self._annotations.append(list(added_before_samples.values()), ignore_index=True)
-        self._annotations = self._annotations.sample(frac=1.0, random_state=42)  # just needed to shuffle before and after rows, more stochasticity may come in DataLoaders
+        self._annotations = self._annotations.sample(frac=1.0,
+                                                     random_state=42)  # just needed to shuffle before and after rows, more stochasticity may come in DataLoaders
 
-        self.objs_to_ids = {name: i for i, name in enumerate(list(set(self._annotations['object_name'])))} if object_conversion_table is None else object_conversion_table
+        self.objs_to_ids = {name: i for i, name in enumerate(list(
+            set(self._annotations['object_name'])))} if object_conversion_table is None else object_conversion_table
 
         self.ids_to_objs = {v: k for k, v in self.objs_to_ids.items()}
 
@@ -467,7 +546,8 @@ class BBoxDataset(torch.utils.data.Dataset):
     def get_stats(self):
         if self._stats is None:
             tmp = self._annotations.copy()
-            tmp[lambda df: df['after_image_path'].isnull()]['after_image_path'] = tmp[lambda df: df['after_image_path'].isnull()]['before_image_path']
+            tmp[lambda df: df['after_image_path'].isnull()]['after_image_path'] = \
+            tmp[lambda df: df['after_image_path'].isnull()]['before_image_path']
             acc = torch.stack([to_tensor(Image.open(pth)) for pth in tmp['after_image_path']]).view(3, -1)
             self._stats = {'mean': acc.mean(dim=-1), 'std': acc.std(dim=-1)}
 
@@ -507,8 +587,6 @@ def contrastive_collate(batch):
     return res
 
 
-
-
 def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transform=None, valid_ratio=0.2, **kwargs):
     if dataset_type == 'bboxes':
         # Transforms should be not none because FastRCNN require PIL images
@@ -531,10 +609,12 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
 
         train_set, valid_set, test_set = dataset.split(valid_ratio=valid_ratio, for_regression=False)
 
-        touse_collate = contrastive_collate if (kwargs.get('use_contrastive', False) or kwargs.get('use_infonce', False)) else vect_collate
+        touse_collate = contrastive_collate if (
+                    kwargs.get('use_contrastive', False) or kwargs.get('use_infonce', False)) else vect_collate
         train_dl = torch.utils.data.DataLoader(train_set, batch_size=batch_size, collate_fn=touse_collate)
         valid_dl = torch.utils.data.DataLoader(valid_set, batch_size=1, collate_fn=touse_collate)
-        test_dl = torch.utils.data.DataLoader(test_set, batch_size=1, collate_fn=touse_collate)  # here for compatibility, but dataset will be accessed with test_dl.dataset
+        test_dl = torch.utils.data.DataLoader(test_set, batch_size=1,
+                                              collate_fn=touse_collate)  # here for compatibility, but dataset will be accessed with test_dl.dataset
     else:
         raise ValueError(f"unsupported type of dataset '{dataset_type}'")
     return dataset, train_dl, valid_dl, test_dl
@@ -543,5 +623,6 @@ def get_data(data_path, batch_size=32, dataset_type=None, obj_dict=None, transfo
 if __name__ == "__main__":
     from pprint import pprint
     from visual_features.data import *
+
     ds = VecTransformDataset()
     pprint(ds[0])
